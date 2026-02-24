@@ -1,49 +1,91 @@
-# Nestor — The Butler Bot
+# Nestor — Your Private Family Butler on Telegram
 
-A private Telegram butler bot inspired by Nestor from Tintin's Marlinspike Hall.
-Manages a shared family Google Calendar, takes notes in Google Drive, and
-researches things on the web — all through natural conversation.
+<p align="center"><em>"Very good, Sir. I shall attend to it at once."</em></p>
+
+Nestor is a private, self-hosted Telegram bot that acts as a shared family assistant. Inspired by the unflappable butler from Tintin's Marlinspike Hall, he manages your calendar, sends emails, researches things on the web, and keeps notes — all through natural conversation.
+
+Deploy him on any VPS. Only whitelisted family members can interact with him. Everyone else is silently ignored.
+
+---
+
+## What Nestor Can Do
+
+| Capability | Examples |
+|---|---|
+| **Shared Calendar** | "Schedule a dentist appointment for Tuesday at 10am" |
+| | "What's on the calendar this week?" |
+| | "Move tomorrow's meeting to 3pm" |
+| **Email** | "Email the school about next week's absence" |
+| | "Check if I have any unread emails" |
+| | "Read the latest email from Amazon" |
+| **Web Research** | "When does school break for Thanksgiving?" |
+| | "Find the lunch menu for Lincoln Elementary" |
+| | "What's the weather like in Denver this weekend?" |
+| **Notes & Docs** | "Save a note about the plumber's phone number" |
+| | "What notes do we have about vacation plans?" |
+| **Schedule Summaries** | `/today` — today's agenda |
+| | `/week` — the week ahead |
+
+Nestor uses tool-calling AI (Anthropic Claude or OpenAI GPT-4) to understand requests and take action. He manages a multi-step workflow internally — checking the calendar, creating events, confirming results — and replies with a concise, butler-appropriate response.
+
+## Architecture
+
+```
+Telegram → Whitelist Gate → LLM Brain (agentic tool-calling loop)
+                                │
+                    ┌───────────┴────────────┐
+                    │                        │
+            Google Calendar       Google Drive/Docs
+            Gmail (SMTP/IMAP)     Web Search
+            DateTime              SQLite Memory
+```
+
+**Key design choices:**
+- **Composable tools** — each capability is a self-contained `BaseTool` subclass. Add new tools in minutes.
+- **Provider-agnostic LLM** — swap between Anthropic and OpenAI with one env var.
+- **Portable** — Docker, docker-compose, or systemd. All config via environment variables.
+- **Zero secrets in code** — everything from `.env` or env vars. Git history is clean.
+- **Private by default** — Telegram user ID whitelist. Silent rejection of strangers.
 
 ## Prerequisites
 
-- Python 3.12+
-- A Telegram Bot token (from [@BotFather](https://t.me/BotFather))
-- A Google Cloud project with Calendar, Drive, and Docs APIs enabled
+- Python 3.12+ (or Docker)
+- A Telegram Bot token ([create one via @BotFather](https://t.me/BotFather))
 - An Anthropic or OpenAI API key
+- A Gmail account for Nestor (for calendar, drive, and email)
+- A Google Cloud project with Calendar, Drive, and Docs APIs enabled
 
-## Quick Setup
+## Quick Start
 
 ```bash
-# 1. Clone & enter
-git clone <repo-url> nestor && cd nestor
+# Clone
+git clone https://github.com/YOUR_USER/nestor.git && cd nestor
 
-# 2. Configure
+# Configure
 cp .env.example .env
-# Edit .env with your actual values
+# Edit .env — see configuration section below
 
-# 3. Create venv & install
+# Install
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Google OAuth (first run only)
-# Place your credentials.json in the project root
-# On first run, a browser window opens for OAuth consent
-# The token is cached in token.json for subsequent runs
+# Google OAuth (first run only — opens a browser)
+python google_auth_setup.py
 
-# 5. Run
+# Run
 python main.py
 ```
 
-## Docker Setup
+## Docker
 
 ```bash
-cp .env.example .env   # fill in values
-mkdir -p data          # for persistent DB + tokens
+cp .env.example .env    # fill in values
+mkdir -p data           # persistent storage
 docker compose up -d
 ```
 
-## systemd Setup (VPS)
+## systemd (VPS)
 
 ```bash
 sudo cp nestor.service /etc/systemd/system/
@@ -52,58 +94,47 @@ sudo systemctl enable nestor
 sudo systemctl start nestor
 ```
 
+## Configuration
+
+All configuration is via environment variables (or `.env` file). See [`.env.example`](.env.example) for the full list.
+
+| Variable | Required | Description |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Yes | From @BotFather |
+| `ALLOWED_TELEGRAM_IDS` | Yes | Comma-separated Telegram user IDs |
+| `LLM_PROVIDER` | No | `anthropic` (default) or `openai` |
+| `ANTHROPIC_API_KEY` | If using Anthropic | API key |
+| `OPENAI_API_KEY` | If using OpenAI | API key |
+| `GMAIL_ADDRESS` | For email | Nestor's Gmail address |
+| `GMAIL_APP_PASSWORD` | For email | Gmail App Password ([create one](https://myaccount.google.com/apppasswords)) |
+| `GOOGLE_CREDENTIALS_FILE` | For calendar/drive | Path to OAuth `credentials.json` |
+| `GOOGLE_CALENDAR_ID` | No | Calendar ID (default: `primary`) |
+| `NESTOR_TIMEZONE` | No | IANA timezone (default: `America/Los_Angeles`) |
+
 ## Google Cloud Setup
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (e.g. "Nestor Butler")
-3. Enable these APIs:
-   - Google Calendar API
-   - Google Drive API
-   - Google Docs API
-4. Go to **Credentials** → **Create Credentials** → **OAuth client ID**
-   - Application type: **Desktop app**
-   - Download the JSON and save as `credentials.json` in the project root
-5. Add your Gmail accounts as test users under **OAuth consent screen** (while in testing mode)
+1. Create a [Google Cloud project](https://console.cloud.google.com/)
+2. Enable **Google Calendar API**, **Google Drive API**, and **Google Docs API**
+3. Configure the **OAuth consent screen** (External, add Nestor's Gmail as a test user)
+4. Create **OAuth credentials** (Desktop app) and download `credentials.json`
+5. Run `python google_auth_setup.py` to complete the OAuth flow
+6. Share Nestor's calendar with your family members
 
-### Calendar Sharing
+## Gmail Setup (Email)
 
-Log into Nestor's Gmail account and share the primary calendar with
-your and your wife's Google accounts (Settings → Share with specific people).
+Nestor uses SMTP/IMAP with a Gmail App Password (no Google Cloud API needed for email):
+
+1. Enable **2-Step Verification** on Nestor's Gmail account
+2. Create an [App Password](https://myaccount.google.com/apppasswords)
+3. Set `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` in `.env`
 
 ## Getting Telegram User IDs
 
-Send a message to [@userinfobot](https://t.me/userinfobot) on Telegram.
-It will reply with your numeric user ID. Do this for both you and your wife,
-then add both IDs (comma-separated) to `ALLOWED_TELEGRAM_IDS` in `.env`.
-
-## Architecture
-
-```
-Telegram → telegram_handler.py (whitelist gate)
-         → brain.py (agentic loop)
-           → llm.py (Anthropic/OpenAI with tool calling)
-           → tools/ (calendar, drive, search, datetime)
-           → memory.py (SQLite conversation history)
-```
-
-**Key files:**
-
-| File | Purpose |
-|---|---|
-| `main.py` | Entry point — wires everything together |
-| `nestor/config.py` | Env-based configuration |
-| `nestor/telegram_handler.py` | Telegram bot with whitelist |
-| `nestor/brain.py` | Agentic loop: LLM + tools + memory |
-| `nestor/llm.py` | Anthropic & OpenAI provider abstraction |
-| `nestor/memory.py` | SQLite conversation & metadata store |
-| `nestor/google_auth.py` | Shared Google OAuth2 (single token, all scopes) |
-| `nestor/tools/` | Extensible tool system |
-| `nestor/prompts/system.txt` | Nestor's personality & instructions |
+Message [@userinfobot](https://t.me/userinfobot) on Telegram. It replies with your numeric user ID. Add all family members' IDs (comma-separated) to `ALLOWED_TELEGRAM_IDS`.
 
 ## Adding New Tools
 
-1. Create a file in `nestor/tools/` (e.g. `weather_tool.py`)
-2. Subclass `BaseTool`:
+Create a file in `nestor/tools/` and subclass `BaseTool`:
 
 ```python
 from nestor.tools import BaseTool
@@ -121,16 +152,48 @@ class WeatherTool(BaseTool):
 
     async def execute(self, **kwargs) -> str:
         location = kwargs["location"]
-        # ... your implementation ...
+        # ... implementation ...
         return f"Weather in {location}: 72°F, sunny"
 ```
 
-3. Register it in `main.py`'s `_register_tools()` function.
+Register it in `main.py`'s `_register_tools()` function. Nestor's LLM will automatically discover and use it.
 
-## Security Notes
+## Project Structure
 
-- **All secrets** live in `.env` (gitignored) or environment variables — never in code
-- **Telegram whitelist** uses immutable numeric user IDs, not usernames
-- **Strangers are silently ignored** — the bot's existence is not revealed
-- **Google tokens** are stored locally and gitignored
-- **No inbound ports** needed — Telegram uses polling mode
+```
+nestor/
+├── main.py                      # Entry point — wires everything together
+├── nestor/
+│   ├── config.py                # Env-based configuration
+│   ├── telegram_handler.py      # Telegram bot + whitelist
+│   ├── brain.py                 # Agentic loop (LLM + tools + memory)
+│   ├── llm.py                   # Anthropic & OpenAI abstraction
+│   ├── memory.py                # SQLite conversation history
+│   ├── google_auth.py           # Shared Google OAuth2
+│   ├── prompts/system.txt       # Nestor's personality
+│   └── tools/
+│       ├── __init__.py          # BaseTool + ToolRegistry
+│       ├── calendar_tool.py     # Google Calendar CRUD
+│       ├── drive_tool.py        # Google Drive/Docs
+│       ├── email_tool.py        # Gmail via SMTP/IMAP
+│       ├── search_tool.py       # Web search + page fetcher
+│       └── datetime_tool.py     # Timezone-aware date/time
+├── Dockerfile                   # Multi-stage Docker build
+├── docker-compose.yml           # One-command deployment
+├── nestor.service               # systemd unit file
+├── google_auth_setup.py         # One-time OAuth helper
+└── .env.example                 # Configuration template
+```
+
+## Security
+
+- All secrets in `.env` (gitignored) — never in source code
+- Telegram whitelist uses immutable numeric user IDs
+- Strangers are silently ignored — the bot's existence is never revealed
+- Google OAuth tokens stored locally with `600` permissions
+- No inbound ports required — Telegram uses long-polling
+- Git history contains zero secrets or PII
+
+## License
+
+MIT
