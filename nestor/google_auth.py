@@ -6,6 +6,7 @@ All Google services share a single token with combined scopes.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -22,6 +23,13 @@ ALL_SCOPES = [
 ]
 
 _cached_creds: Credentials | None = None
+
+
+def _set_owner_only_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.warning("Could not set secure permissions on %s", path, exc_info=True)
 
 
 def get_google_credentials(
@@ -46,6 +54,7 @@ def get_google_credentials(
     token_path = Path(token_file)
 
     if token_path.exists():
+        _set_owner_only_permissions(token_path)
         creds = Credentials.from_authorized_user_file(str(token_path), ALL_SCOPES)
 
     if not creds or not creds.valid:
@@ -59,6 +68,7 @@ def get_google_credentials(
             )
             creds = flow.run_local_server(port=0)
         token_path.write_text(creds.to_json())
+        _set_owner_only_permissions(token_path)
         logger.info("Google token saved to %s", token_path)
 
     _cached_creds = creds

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
+import socket
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -24,6 +26,14 @@ _USER_AGENT = (
 )
 _MAX_PAGE_TEXT = 4000
 _HTTP_TIMEOUT = 20.0
+_MAX_REDIRECTS = 5
+_MAX_FETCH_BYTES = 2 * 1024 * 1024
+_BLOCKED_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "metadata.google.internal",
+}
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 # ---------------------------------------------------------------------------
@@ -55,13 +65,18 @@ class WebSearchTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> str:
         query: str = kwargs["query"]
-        num_results: int = kwargs.get("num_results", 5)
+        try:
+            num_results = int(kwargs.get("num_results", 5))
+        except (TypeError, ValueError):
+            num_results = 5
+        num_results = max(1, min(num_results, 10))
 
         try:
             async with httpx.AsyncClient(
                 headers={"User-Agent": _USER_AGENT},
                 timeout=_HTTP_TIMEOUT,
                 follow_redirects=True,
+                trust_env=False,
             ) as client:
                 resp = await client.post(_SEARCH_URL, data={"q": query})
                 resp.raise_for_status()
@@ -148,28 +163,122 @@ class FetchWebPageTool(BaseTool):
             async with httpx.AsyncClient(
                 headers={"User-Agent": _USER_AGENT},
                 timeout=_HTTP_TIMEOUT,
-                follow_redirects=True,
+                follow_redirects=False,
+                trust_env=False,
             ) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
+                final_url, content_type, html = await _fetch_with_policy(client, url)
 
-            content_type = resp.headers.get("content-type", "")
             if "html" not in content_type and "text" not in content_type:
                 return f"The URL returned non-text content ({content_type}). Cannot extract text."
 
-            text = _extract_page_text(resp.text)
+            text = _extract_page_text(html)
             if not text.strip():
                 return "The page was fetched but no meaningful text content could be extracted."
 
             if len(text) > _MAX_PAGE_TEXT:
                 text = text[:_MAX_PAGE_TEXT] + "\n\n[...truncated]"
 
-            return f"Content from {url}:\n\n{text}"
+            return f"Content from {final_url}:\n\n{text}"
+        except ValueError as exc:
+            return f"Error fetching {url}: {exc}"
         except httpx.HTTPStatusError as exc:
             return f"Error fetching {url}: HTTP {exc.response.status_code}"
         except Exception as exc:
             logger.exception("Failed to fetch web page %s", url)
             return f"Error fetching web page: {exc}"
+
+
+def _is_blocked_ip(ip: IPAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _resolve_host_ips(hostname: str) -> set[IPAddress]:
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve host {hostname!r}: {exc}") from exc
+
+    ips: set[IPAddress] = set()
+    for info in infos:
+        addr = info[4][0]
+        ips.add(ipaddress.ip_address(addr))
+    if not ips:
+        raise ValueError(f"Host {hostname!r} did not resolve to any IP addresses")
+    return ips
+
+
+def _validate_target_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only http:// and https:// URLs are allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with embedded credentials are not allowed")
+    if not parsed.hostname:
+        raise ValueError("URL must include a hostname")
+
+    host = parsed.hostname.rstrip(".").lower()
+    if host in _BLOCKED_HOSTNAMES or host.endswith(".local"):
+        raise ValueError(f"Host {host!r} is not allowed")
+
+    try:
+        ip = ipaddress.ip_address(host)
+        ips = {ip}
+    except ValueError:
+        ips = _resolve_host_ips(parsed.hostname)
+
+    blocked = [str(ip) for ip in ips if _is_blocked_ip(ip)]
+    if blocked:
+        raise ValueError(
+            f"Host {host!r} resolves to blocked address(es): {', '.join(blocked)}"
+        )
+
+
+async def _read_limited_body(response: httpx.Response) -> str:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > _MAX_FETCH_BYTES:
+            raise ValueError(
+                f"Response exceeded size limit ({_MAX_FETCH_BYTES} bytes)"
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    encoding = response.encoding or "utf-8"
+    return data.decode(encoding, errors="replace")
+
+
+async def _fetch_with_policy(
+    client: httpx.AsyncClient, initial_url: str
+) -> tuple[str, str, str]:
+    current_url = initial_url
+
+    for hop in range(_MAX_REDIRECTS + 1):
+        _validate_target_url(current_url)
+
+        async with client.stream("GET", current_url) as resp:
+            if resp.is_redirect:
+                location = resp.headers.get("location")
+                if not location:
+                    raise ValueError("Redirect response missing Location header")
+                if hop >= _MAX_REDIRECTS:
+                    raise ValueError("Too many redirects")
+                current_url = urljoin(current_url, location)
+                continue
+
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            body = await _read_limited_body(resp)
+            return current_url, content_type, body
+
+    raise ValueError("Too many redirects")
 
 
 def _extract_page_text(html: str) -> str:

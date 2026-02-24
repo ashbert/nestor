@@ -7,10 +7,12 @@ back, and persists the exchange.
 
 from __future__ import annotations
 
+import secrets
 import json
 import logging
 import os
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -21,6 +23,21 @@ from nestor.tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ROUNDS = 5
+_CONFIRMATION_TTL = timedelta(minutes=15)
+_SENSITIVE_TOOLS = {
+    "send_email",
+    "create_calendar_event",
+    "delete_calendar_event",
+    "create_note",
+    "append_note",
+}
+
+
+@dataclass(slots=True)
+class PendingAction:
+    token: str
+    tool_calls: list[ToolCall]
+    created_at: datetime
 
 
 class NestorBrain:
@@ -37,6 +54,7 @@ class NestorBrain:
         self._tools = tool_registry
         self._memory = memory
         self._system_prompt = system_prompt
+        self._pending_actions: dict[int, PendingAction] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -89,6 +107,103 @@ class NestorBrain:
             )
         return results
 
+    def _persist_exchange(
+        self, user_id: int, user_name: str, user_message: str, assistant_message: str
+    ) -> None:
+        self._memory.save_message(user_id, "user", f"[{user_name}]: {user_message}")
+        self._memory.save_message(user_id, "assistant", assistant_message)
+
+    def _get_pending_action(self, user_id: int) -> PendingAction | None:
+        pending = self._pending_actions.get(user_id)
+        if not pending:
+            return None
+        if datetime.now(timezone.utc) - pending.created_at > _CONFIRMATION_TTL:
+            self._pending_actions.pop(user_id, None)
+            return None
+        return pending
+
+    @staticmethod
+    def _extract_confirmation_token(message: str) -> str | None:
+        text = message.strip()
+        lowered = text.lower()
+        for prefix in ("confirm ", "approve "):
+            if lowered.startswith(prefix):
+                token = text[len(prefix) :].strip()
+                return token or None
+        return None
+
+    @staticmethod
+    def _is_cancel_message(message: str) -> bool:
+        return message.strip().lower() in {"cancel", "deny", "reject", "abort"}
+
+    def _stage_pending_action(self, user_id: int, tool_calls: list[ToolCall]) -> str:
+        token = f"{secrets.randbelow(1_000_000):06d}"
+        self._pending_actions[user_id] = PendingAction(
+            token=token,
+            tool_calls=tool_calls,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        lines = [
+            "I need explicit confirmation before executing these side-effect actions:",
+        ]
+        for tc in tool_calls:
+            args = json.dumps(tc.arguments, ensure_ascii=True)
+            if len(args) > 220:
+                args = args[:220] + "... [truncated]"
+            lines.append(f"- `{tc.name}` with args: {args}")
+        lines.append("")
+        lines.append(f"Reply with `confirm {token}` to proceed.")
+        lines.append("Reply with `cancel` to discard this request.")
+        lines.append("This confirmation expires in 15 minutes.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_confirmed_results(tool_calls: list[ToolCall], tool_results: list[dict[str, Any]]) -> str:
+        lines = ["Confirmed. I executed the requested actions:"]
+        for tc, result in zip(tool_calls, tool_results):
+            content = str(result.get("content", "")).strip()
+            if len(content) > 450:
+                content = content[:450] + "... [truncated]"
+            lines.append(f"- `{tc.name}`: {content}")
+        return "\n".join(lines)
+
+    async def _maybe_handle_confirmation(
+        self, user_id: int, user_name: str, message: str
+    ) -> str | None:
+        pending = self._get_pending_action(user_id)
+        token = self._extract_confirmation_token(message)
+
+        if not pending:
+            if token:
+                reply = "No pending action was found to confirm."
+                self._persist_exchange(user_id, user_name, message, reply)
+                return reply
+            return None
+
+        if self._is_cancel_message(message):
+            self._pending_actions.pop(user_id, None)
+            reply = "Understood. I cancelled the pending side-effect actions."
+            self._persist_exchange(user_id, user_name, message, reply)
+            return reply
+
+        if not token:
+            return None
+
+        if token != pending.token:
+            reply = (
+                "That confirmation token is invalid. "
+                f"Reply with `confirm {pending.token}` or `cancel`."
+            )
+            self._persist_exchange(user_id, user_name, message, reply)
+            return reply
+
+        tool_results = await self._execute_tool_calls(pending.tool_calls)
+        self._pending_actions.pop(user_id, None)
+        reply = self._format_confirmed_results(pending.tool_calls, tool_results)
+        self._persist_exchange(user_id, user_name, message, reply)
+        return reply
+
     @staticmethod
     def _assistant_message_from_response(
         response: LLMResponse,
@@ -122,6 +237,12 @@ class NestorBrain:
 
         Returns the final text response from the LLM.
         """
+        confirmation_reply = await self._maybe_handle_confirmation(
+            user_id, user_name, message
+        )
+        if confirmation_reply is not None:
+            return confirmation_reply
+
         # Inject live datetime into the system prompt for this turn.
         self._llm.system_prompt = self._inject_datetime(self._system_prompt)
 
@@ -141,6 +262,18 @@ class NestorBrain:
             if not response.tool_calls:
                 break
 
+            if any(tc.name in _SENSITIVE_TOOLS for tc in response.tool_calls):
+                existing = self._get_pending_action(user_id)
+                if existing:
+                    final_text = (
+                        "You already have a pending confirmation. "
+                        f"Reply with `confirm {existing.token}` or `cancel` first."
+                    )
+                else:
+                    final_text = self._stage_pending_action(user_id, response.tool_calls)
+                self._persist_exchange(user_id, user_name, message, final_text)
+                return final_text
+
             # Execute tools and feed results back.
             tool_results = await self._execute_tool_calls(response.tool_calls)
             messages.extend(tool_results)
@@ -149,9 +282,7 @@ class NestorBrain:
             "I do beg your pardon — I seem to have lost my train of thought."
         )
 
-        # Persist the exchange (user message + assistant reply).
-        self._memory.save_message(user_id, "user", f"[{user_name}]: {message}")
-        self._memory.save_message(user_id, "assistant", final_text)
+        self._persist_exchange(user_id, user_name, message, final_text)
 
         return final_text
 

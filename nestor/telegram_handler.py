@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from typing import TypeAlias
 
 from telegram import Update
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction, ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -64,6 +64,12 @@ def _is_allowed(user_id: int | None, allowed_ids: set[int]) -> bool:
     return user_id is not None and user_id in allowed_ids
 
 
+def _is_private_chat(update: Update) -> bool:
+    """Return True only for Telegram private chats."""
+    chat = update.effective_chat
+    return bool(chat and chat.type == ChatType.PRIVATE)
+
+
 # ---------------------------------------------------------------------------
 # Handler factories (closures over configuration)
 # ---------------------------------------------------------------------------
@@ -75,6 +81,8 @@ def _make_start_handler(allowed_ids: set[int]):
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        if not _is_private_chat(update):
+            return
         if not update.effective_user or not _is_allowed(
             update.effective_user.id, allowed_ids
         ):
@@ -96,6 +104,8 @@ def _make_today_handler(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        if not _is_private_chat(update):
+            return
         user = update.effective_user
         if not user or not _is_allowed(user.id, allowed_ids):
             return
@@ -126,6 +136,8 @@ def _make_week_handler(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        if not _is_private_chat(update):
+            return
         user = update.effective_user
         if not user or not _is_allowed(user.id, allowed_ids):
             return
@@ -156,6 +168,8 @@ def _make_message_handler(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        if not _is_private_chat(update):
+            return
         user = update.effective_user
         if not user or not _is_allowed(user.id, allowed_ids):
             return
