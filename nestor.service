@@ -1,0 +1,15 @@
+[Unit]
+Description=Nestor Butler Bot
+After=network.target
+
+[Service]
+Type=simple
+User=exedev
+WorkingDirectory=/home/exedev/nestor
+EnvironmentFile=/home/exedev/nestor/.env
+ExecStart=/home/exedev/nestor/venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

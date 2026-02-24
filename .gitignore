@@ -1,0 +1,13 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+token.json
+credentials.json
+__pycache__/
+*.pyc
+venv/
+data/
+.mypy_cache/
+google_auth_setup.py
+SECURITY_AUDIT.md
