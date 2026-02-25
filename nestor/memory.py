@@ -1,7 +1,50 @@
 """SQLite-based conversation memory and metadata store for Nestor."""
 
+import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _set_owner_only_file_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.warning(
+            "Could not set secure file permissions on %s",
+            path,
+            exc_info=True,
+        )
+
+
+def _set_owner_only_directory_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        logger.warning(
+            "Could not set secure directory permissions on %s",
+            path,
+            exc_info=True,
+        )
+
+
+def _harden_sqlite_permissions(db_path: str) -> None:
+    """Enforce restrictive permissions for SQLite and sidecar files."""
+    db_file = Path(db_path)
+    parent = db_file.parent
+
+    # Avoid mutating cwd permissions when using a relative path like "nestor.db".
+    if parent != Path("."):
+        parent.mkdir(parents=True, exist_ok=True)
+        _set_owner_only_directory_permissions(parent)
+
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            _set_owner_only_file_permissions(candidate)
 
 
 class MemoryStore:
@@ -9,11 +52,13 @@ class MemoryStore:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        _harden_sqlite_permissions(db_path)
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
+        _harden_sqlite_permissions(db_path)
 
     def _create_tables(self) -> None:
         self.conn.executescript("""
