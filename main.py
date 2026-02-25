@@ -8,6 +8,7 @@ Telegram polling loop until interrupted.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
@@ -15,6 +16,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from nestor.backup import (
+    has_backup_file,
+    restore_database_if_missing,
+    run_periodic_drive_backup,
+)
 from nestor.config import Config
 from nestor.memory import MemoryStore
 from nestor.llm import create_provider
@@ -49,7 +55,7 @@ def _setup_logging(level_name: str) -> None:
 # Tool registration
 # ---------------------------------------------------------------------------
 
-def _register_tools(config: Config) -> ToolRegistry:
+def _register_tools(config: Config, memory: MemoryStore) -> ToolRegistry:
     """Build the tool registry with all available tools.
 
     Google tools are only registered if credentials are available.
@@ -58,6 +64,13 @@ def _register_tools(config: Config) -> ToolRegistry:
 
     # Always available
     registry.register(GetCurrentDateTimeTool())
+    try:
+        from nestor.tools.memory_tool import RememberThoughtTool, RecallThoughtsTool
+        registry.register(RememberThoughtTool(memory))
+        registry.register(RecallThoughtsTool(memory))
+        logger.info("Registered local memory tools")
+    except Exception:
+        logger.warning("Local memory tools unavailable", exc_info=True)
 
     # Web search / fetch
     try:
@@ -172,6 +185,38 @@ async def _run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _request_shutdown, sig)
 
+    restore_status = "local_exists"
+    if config.db_restore_from_drive:
+        if Path(config.google_credentials_file).exists() or Path(config.google_token_file).exists():
+            try:
+                restore_status = await asyncio.to_thread(
+                    restore_database_if_missing,
+                    db_path=config.database_path,
+                    credentials_file=config.google_credentials_file,
+                    token_file=config.google_token_file,
+                    filename=config.db_backup_filename,
+                    folder_id=config.db_backup_drive_folder_id,
+                )
+                if restore_status == "restored":
+                    logger.info(
+                        "Restored local database from Google Drive backup (%s)",
+                        config.db_backup_filename,
+                    )
+                elif restore_status == "backup_not_found":
+                    logger.info(
+                        "No Google Drive DB backup found (%s) — starting with a fresh local DB",
+                        config.db_backup_filename,
+                    )
+            except Exception:
+                restore_status = "restore_error"
+                logger.exception("Database restore from Google Drive failed")
+        else:
+            logger.info(
+                "DB restore enabled but Google credentials are unavailable (%s / %s)",
+                config.google_credentials_file,
+                config.google_token_file,
+            )
+
     # -- Database -----------------------------------------------------------
     memory = MemoryStore(config.database_path)
     logger.info("Database: %s", config.database_path)
@@ -194,7 +239,7 @@ async def _run() -> None:
     logger.info("LLM: %s / %s", config.llm_provider, config.llm_model)
 
     # -- Tools --------------------------------------------------------------
-    tools = _register_tools(config)
+    tools = _register_tools(config, memory)
 
     # -- Brain --------------------------------------------------------------
     brain = NestorBrain(
@@ -220,6 +265,60 @@ async def _run() -> None:
     await app.updater.start_polling(drop_pending_updates=True)  # type: ignore[union-attr]
     logger.info("Telegram polling started – Nestor is ready.")
 
+    backup_task: asyncio.Task[None] | None = None
+    if config.db_backup_to_drive:
+        if Path(config.google_credentials_file).exists() or Path(config.google_token_file).exists():
+            run_on_start = config.db_backup_on_start
+            db_path = Path(config.database_path)
+            local_db_exists = db_path.exists() and db_path.stat().st_size > 0
+            if local_db_exists:
+                try:
+                    remote_exists = await asyncio.to_thread(
+                        has_backup_file,
+                        credentials_file=config.google_credentials_file,
+                        token_file=config.google_token_file,
+                        filename=config.db_backup_filename,
+                        folder_id=config.db_backup_drive_folder_id,
+                    )
+                    if not remote_exists:
+                        run_on_start = True
+                        logger.info(
+                            "No Drive DB backup found for %s — forcing immediate startup backup",
+                            config.db_backup_filename,
+                        )
+                except Exception:
+                    logger.exception("Could not verify Drive DB backup presence")
+            if restore_status == "restore_error":
+                run_on_start = False
+                logger.warning(
+                    "Skipping immediate DB backup on startup because restore failed. "
+                    "Scheduled backups will continue."
+                )
+            backup_task = asyncio.create_task(
+                run_periodic_drive_backup(
+                    db_path=config.database_path,
+                    credentials_file=config.google_credentials_file,
+                    token_file=config.google_token_file,
+                    stop_event=_shutdown_event,
+                    interval_hours=config.db_backup_interval_hours,
+                    filename=config.db_backup_filename,
+                    folder_id=config.db_backup_drive_folder_id,
+                    run_on_start=run_on_start,
+                )
+            )
+            logger.info(
+                "Drive DB backups enabled (every %sh, file=%s)",
+                config.db_backup_interval_hours,
+                config.db_backup_filename,
+            )
+        else:
+            logger.warning(
+                "Drive DB backups enabled but Google credentials are unavailable "
+                "(%s / %s)",
+                config.google_credentials_file,
+                config.google_token_file,
+            )
+
     # Block until shutdown signal.
     await _shutdown_event.wait()
 
@@ -228,6 +327,15 @@ async def _run() -> None:
     await app.updater.stop()  # type: ignore[union-attr]
     await app.stop()
     await app.shutdown()
+
+    if backup_task:
+        try:
+            await asyncio.wait_for(backup_task, timeout=15)
+        except asyncio.TimeoutError:
+            backup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await backup_task
+
     logger.info("Nestor stopped.")
 
 

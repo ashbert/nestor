@@ -23,6 +23,8 @@ Deploy him on any VPS. Only whitelisted family members can interact with him. Ev
 | | "What's the weather like in Denver this weekend?" |
 | **Notes & Docs** | "Save a note about the plumber's phone number" |
 | | "What notes do we have about vacation plans?" |
+| **Long-Term Memory** | "Remember that we prefer Delta flights when possible" |
+| | "What did I ask you to remember about school pickup?" |
 | **Schedule Summaries** | `/today` — today's agenda |
 | | `/week` — the week ahead |
 
@@ -110,6 +112,19 @@ All configuration is via environment variables (or `.env` file). See [`.env.exam
 | `GOOGLE_CREDENTIALS_FILE` | For calendar/drive | Path to OAuth `credentials.json` |
 | `GOOGLE_CALENDAR_ID` | No | Calendar ID (default: `primary`) |
 | `NESTOR_TIMEZONE` | No | IANA timezone (default: `America/Los_Angeles`) |
+| `DB_BACKUP_TO_DRIVE` | No | Enable periodic SQLite backup to Google Drive (default: `true`) |
+| `DB_BACKUP_INTERVAL_HOURS` | No | Backup cadence in hours (default: `24`) |
+| `DB_BACKUP_FILENAME` | No | Backup filename in Drive (default: `nestor-backup-latest.sqlite3`) |
+| `DB_BACKUP_DRIVE_FOLDER_ID` | No | Optional Drive folder ID for backups |
+| `DB_BACKUP_ON_START` | No | Run one backup immediately on startup (default: `true`) |
+| `DB_RESTORE_FROM_DRIVE` | No | Restore local DB from Drive backup if missing on startup (default: `true`) |
+
+### DB Backup/Restore Behavior
+
+- Nestor uploads a SQLite snapshot to Google Drive on the configured cadence.
+- If local DB exists but no Drive backup is found, Nestor forces an immediate startup backup.
+- If local `DATABASE_PATH` is missing at startup, Nestor will attempt to restore it from the Drive backup file before opening SQLite.
+- If no backup exists in Drive, Nestor starts with a fresh local DB.
 
 ## Google Cloud Setup
 
@@ -169,6 +184,7 @@ nestor/
 │   ├── brain.py                 # Agentic loop (LLM + tools + memory)
 │   ├── llm.py                   # Anthropic & OpenAI abstraction
 │   ├── memory.py                # SQLite conversation history
+│   ├── backup.py                # Periodic SQLite → Google Drive backup task
 │   ├── google_auth.py           # Shared Google OAuth2
 │   ├── prompts/system.txt       # Nestor's personality
 │   └── tools/
@@ -176,6 +192,7 @@ nestor/
 │       ├── calendar_tool.py     # Google Calendar CRUD
 │       ├── drive_tool.py        # Google Drive/Docs
 │       ├── email_tool.py        # Gmail via SMTP/IMAP
+│       ├── memory_tool.py       # Local long-term memory tools
 │       ├── search_tool.py       # Web search + page fetcher
 │       └── datetime_tool.py     # Timezone-aware date/time
 ├── Dockerfile                   # Multi-stage Docker build
