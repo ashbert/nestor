@@ -37,6 +37,13 @@ class MemoryStore:
                 PRIMARY KEY (user_id, key)
             );
 
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                user_id     INTEGER PRIMARY KEY,
+                token       TEXT    NOT NULL,
+                tool_calls  TEXT    NOT NULL,
+                created_at  DATETIME DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS notes (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 title       TEXT    NOT NULL,
@@ -114,6 +121,38 @@ class MemoryStore:
             "ON CONFLICT(user_id, key) DO UPDATE "
             "SET value = excluded.value, updated_at = excluded.updated_at",
             (user_id, key, value),
+        )
+        self.conn.commit()
+
+    # ── Pending actions (survive restarts) ────────────────────────────
+
+    def save_pending_action(
+        self, user_id: int, token: str, tool_calls_json: str
+    ) -> None:
+        """Store a pending confirmation action."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pending_actions (user_id, token, tool_calls, created_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            (user_id, token, tool_calls_json),
+        )
+        self.conn.commit()
+
+    def get_pending_action(self, user_id: int) -> dict | None:
+        """Retrieve a pending action for a user (or None)."""
+        row = self.conn.execute(
+            "SELECT token, tool_calls, created_at FROM pending_actions WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return (
+            {"token": row["token"], "tool_calls": row["tool_calls"], "created_at": row["created_at"]}
+            if row
+            else None
+        )
+
+    def delete_pending_action(self, user_id: int) -> None:
+        """Remove a pending action."""
+        self.conn.execute(
+            "DELETE FROM pending_actions WHERE user_id = ?", (user_id,)
         )
         self.conn.commit()
 

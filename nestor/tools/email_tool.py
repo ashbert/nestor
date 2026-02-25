@@ -123,7 +123,7 @@ class SendEmailTool(BaseTool):
             )
         except Exception as exc:
             logger.exception("Failed to send email")
-            return f"Error sending email: {exc}"
+            return f"TOOL ERROR — email was NOT sent. Reason: {exc}"
 
 
 class SearchEmailTool(BaseTool):

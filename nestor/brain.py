@@ -54,7 +54,7 @@ class NestorBrain:
         self._tools = tool_registry
         self._memory = memory
         self._system_prompt = system_prompt
-        self._pending_actions: dict[int, PendingAction] = {}
+        # Pending actions are now persisted in SQLite via self._memory
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -114,13 +114,18 @@ class NestorBrain:
         self._memory.save_message(user_id, "assistant", assistant_message)
 
     def _get_pending_action(self, user_id: int) -> PendingAction | None:
-        pending = self._pending_actions.get(user_id)
-        if not pending:
+        row = self._memory.get_pending_action(user_id)
+        if not row:
             return None
-        if datetime.now(timezone.utc) - pending.created_at > _CONFIRMATION_TTL:
-            self._pending_actions.pop(user_id, None)
+        created = datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - created > _CONFIRMATION_TTL:
+            self._memory.delete_pending_action(user_id)
             return None
-        return pending
+        tool_calls = [
+            ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"])
+            for tc in json.loads(row["tool_calls"])
+        ]
+        return PendingAction(token=row["token"], tool_calls=tool_calls, created_at=created)
 
     @staticmethod
     def _extract_confirmation_token(message: str) -> str | None:
@@ -138,11 +143,8 @@ class NestorBrain:
 
     def _stage_pending_action(self, user_id: int, tool_calls: list[ToolCall]) -> str:
         token = f"{secrets.randbelow(1_000_000):06d}"
-        self._pending_actions[user_id] = PendingAction(
-            token=token,
-            tool_calls=tool_calls,
-            created_at=datetime.now(timezone.utc),
-        )
+        tc_json = json.dumps([{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls])
+        self._memory.save_pending_action(user_id, token, tc_json)
 
         lines = [
             "I need explicit confirmation before executing these side-effect actions:",
@@ -182,7 +184,7 @@ class NestorBrain:
             return None
 
         if self._is_cancel_message(message):
-            self._pending_actions.pop(user_id, None)
+            self._memory.delete_pending_action(user_id)
             reply = "Understood. I cancelled the pending side-effect actions."
             self._persist_exchange(user_id, user_name, message, reply)
             return reply
@@ -199,7 +201,7 @@ class NestorBrain:
             return reply
 
         tool_results = await self._execute_tool_calls(pending.tool_calls)
-        self._pending_actions.pop(user_id, None)
+        self._memory.delete_pending_action(user_id)
         reply = self._format_confirmed_results(pending.tool_calls, tool_results)
         self._persist_exchange(user_id, user_name, message, reply)
         return reply
