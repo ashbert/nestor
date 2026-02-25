@@ -196,6 +196,7 @@ async def _run() -> None:
                     token_file=config.google_token_file,
                     filename=config.db_backup_filename,
                     folder_id=config.db_backup_drive_folder_id,
+                    hmac_key=config.db_backup_hmac_key,
                 )
                 if restore_status == "restored":
                     logger.info(
@@ -295,17 +296,18 @@ async def _run() -> None:
                     "Scheduled backups will continue."
                 )
             backup_task = asyncio.create_task(
-                run_periodic_drive_backup(
-                    db_path=config.database_path,
-                    credentials_file=config.google_credentials_file,
-                    token_file=config.google_token_file,
-                    stop_event=_shutdown_event,
-                    interval_hours=config.db_backup_interval_hours,
-                    filename=config.db_backup_filename,
-                    folder_id=config.db_backup_drive_folder_id,
-                    run_on_start=run_on_start,
+                    run_periodic_drive_backup(
+                        db_path=config.database_path,
+                        credentials_file=config.google_credentials_file,
+                        token_file=config.google_token_file,
+                        stop_event=_shutdown_event,
+                        interval_hours=config.db_backup_interval_hours,
+                        filename=config.db_backup_filename,
+                        folder_id=config.db_backup_drive_folder_id,
+                        run_on_start=run_on_start,
+                        hmac_key=config.db_backup_hmac_key,
+                    )
                 )
-            )
             logger.info(
                 "Drive DB backups enabled (every %sh, file=%s)",
                 config.db_backup_interval_hours,

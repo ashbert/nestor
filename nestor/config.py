@@ -70,6 +70,7 @@ class Config:
     db_backup_drive_folder_id: Optional[str] = None
     db_backup_on_start: bool = True
     db_restore_from_drive: bool = True
+    db_backup_hmac_key: Optional[str] = None
 
     # --- Factory ------------------------------------------------------------
     @classmethod
@@ -120,6 +121,7 @@ class Config:
                 os.environ.get("DB_RESTORE_FROM_DRIVE"),
                 True,
             ),
+            db_backup_hmac_key=os.environ.get("DB_BACKUP_HMAC_KEY"),
         )
 
     # --- Validation ---------------------------------------------------------

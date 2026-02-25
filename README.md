@@ -118,10 +118,12 @@ All configuration is via environment variables (or `.env` file). See [`.env.exam
 | `DB_BACKUP_DRIVE_FOLDER_ID` | No | Optional Drive folder ID for backups |
 | `DB_BACKUP_ON_START` | No | Run one backup immediately on startup (default: `true`) |
 | `DB_RESTORE_FROM_DRIVE` | No | Restore local DB from Drive backup if missing on startup (default: `true`) |
+| `DB_BACKUP_HMAC_KEY` | No | Optional secret used to sign/verify backup manifests (recommended) |
 
 ### DB Backup/Restore Behavior
 
 - Nestor uploads a SQLite snapshot to Google Drive on the configured cadence.
+- Each backup also updates a manifest with SHA-256 checksum (and optional HMAC signature).
 - If local DB exists but no Drive backup is found, Nestor forces an immediate startup backup.
 - If local `DATABASE_PATH` is missing at startup, Nestor will attempt to restore it from the Drive backup file before opening SQLite.
 - If no backup exists in Drive, Nestor starts with a fresh local DB.
