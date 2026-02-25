@@ -7,7 +7,6 @@ back, and persists the exchange.
 
 from __future__ import annotations
 
-import secrets
 import json
 import logging
 import os
@@ -24,12 +23,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ROUNDS = 5
 _CONFIRMATION_TTL = timedelta(minutes=15)
-_SENSITIVE_TOOLS = {
+
+# Irreversible actions that require a simple yes/no confirmation
+_CONFIRM_TOOLS = {
     "send_email",
-    "create_calendar_event",
     "delete_calendar_event",
-    "create_note",
-    "append_note",
 }
 
 
@@ -128,36 +126,39 @@ class NestorBrain:
         return PendingAction(token=row["token"], tool_calls=tool_calls, created_at=created)
 
     @staticmethod
-    def _extract_confirmation_token(message: str) -> str | None:
-        text = message.strip()
-        lowered = text.lower()
-        for prefix in ("confirm ", "approve "):
-            if lowered.startswith(prefix):
-                token = text[len(prefix) :].strip()
-                return token or None
-        return None
+    def _is_yes_message(message: str) -> bool:
+        return message.strip().lower() in {
+            "yes", "y", "yep", "yeah", "sure", "ok", "do it",
+            "go ahead", "proceed", "confirm", "approved", "send it",
+        }
 
     @staticmethod
-    def _is_cancel_message(message: str) -> bool:
-        return message.strip().lower() in {"cancel", "deny", "reject", "abort"}
+    def _is_no_message(message: str) -> bool:
+        return message.strip().lower() in {
+            "no", "n", "nope", "cancel", "deny", "reject", "abort",
+            "don't", "dont", "stop", "nevermind", "never mind",
+        }
 
     def _stage_pending_action(self, user_id: int, tool_calls: list[ToolCall]) -> str:
-        token = f"{secrets.randbelow(1_000_000):06d}"
         tc_json = json.dumps([{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls])
-        self._memory.save_pending_action(user_id, token, tc_json)
+        self._memory.save_pending_action(user_id, "yes", tc_json)
 
-        lines = [
-            "I need explicit confirmation before executing these side-effect actions:",
-        ]
+        lines = ["Before I proceed, here's what I'm about to do:"]
         for tc in tool_calls:
-            args = json.dumps(tc.arguments, ensure_ascii=True)
-            if len(args) > 220:
-                args = args[:220] + "... [truncated]"
-            lines.append(f"- `{tc.name}` with args: {args}")
+            if tc.name == "send_email":
+                to = tc.arguments.get("to", "?")
+                subj = tc.arguments.get("subject", "?")
+                lines.append(f"📧 Send email to **{to}** — \"{subj}\"")
+            elif tc.name == "delete_calendar_event":
+                eid = tc.arguments.get("event_id", tc.arguments.get("query", "?"))
+                lines.append(f"🗑️ Delete calendar event: {eid}")
+            else:
+                args = json.dumps(tc.arguments, ensure_ascii=False)
+                if len(args) > 200:
+                    args = args[:200] + "…"
+                lines.append(f"• `{tc.name}`: {args}")
         lines.append("")
-        lines.append(f"Reply with `confirm {token}` to proceed.")
-        lines.append("Reply with `cancel` to discard this request.")
-        lines.append("This confirmation expires in 15 minutes.")
+        lines.append("**Yes** or **No**?")
         return "\n".join(lines)
 
     @staticmethod
@@ -174,37 +175,25 @@ class NestorBrain:
         self, user_id: int, user_name: str, message: str
     ) -> str | None:
         pending = self._get_pending_action(user_id)
-        token = self._extract_confirmation_token(message)
-
         if not pending:
-            if token:
-                reply = "No pending action was found to confirm."
-                self._persist_exchange(user_id, user_name, message, reply)
-                return reply
             return None
 
-        if self._is_cancel_message(message):
+        if self._is_yes_message(message):
+            tool_results = await self._execute_tool_calls(pending.tool_calls)
             self._memory.delete_pending_action(user_id)
-            reply = "Understood. I cancelled the pending side-effect actions."
+            reply = self._format_confirmed_results(pending.tool_calls, tool_results)
             self._persist_exchange(user_id, user_name, message, reply)
             return reply
 
-        if not token:
-            return None
-
-        if token != pending.token:
-            reply = (
-                "That confirmation token is invalid. "
-                f"Reply with `confirm {pending.token}` or `cancel`."
-            )
+        if self._is_no_message(message):
+            self._memory.delete_pending_action(user_id)
+            reply = "Very good, Sir. I've discarded that."
             self._persist_exchange(user_id, user_name, message, reply)
             return reply
 
-        tool_results = await self._execute_tool_calls(pending.tool_calls)
+        # Not a yes/no — clear pending and process as a new message
         self._memory.delete_pending_action(user_id)
-        reply = self._format_confirmed_results(pending.tool_calls, tool_results)
-        self._persist_exchange(user_id, user_name, message, reply)
-        return reply
+        return None
 
     @staticmethod
     def _assistant_message_from_response(
@@ -264,15 +253,11 @@ class NestorBrain:
             if not response.tool_calls:
                 break
 
-            if any(tc.name in _SENSITIVE_TOOLS for tc in response.tool_calls):
-                existing = self._get_pending_action(user_id)
-                if existing:
-                    final_text = (
-                        "You already have a pending confirmation. "
-                        f"Reply with `confirm {existing.token}` or `cancel` first."
-                    )
-                else:
-                    final_text = self._stage_pending_action(user_id, response.tool_calls)
+            # Check if any tool calls need confirmation
+            needs_confirm = [tc for tc in response.tool_calls if tc.name in _CONFIRM_TOOLS]
+            if needs_confirm:
+                # Stage all tool calls (confirmed ones gate the batch)
+                final_text = self._stage_pending_action(user_id, response.tool_calls)
                 self._persist_exchange(user_id, user_name, message, final_text)
                 return final_text
 
