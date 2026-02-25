@@ -25,6 +25,7 @@ from nestor.config import Config
 from nestor.memory import MemoryStore
 from nestor.llm import create_provider
 from nestor.brain import NestorBrain
+from nestor.preflight import run_migration_readiness_preflight
 from nestor.tools import ToolRegistry
 from nestor.tools.datetime_tool import GetCurrentDateTimeTool
 from nestor.telegram_handler import create_bot
@@ -179,6 +180,18 @@ async def _run() -> None:
     _setup_logging(config.log_level)
     logger.info("Nestor starting (provider=%s, model=%s)", config.llm_provider, config.llm_model)
     config.validate()
+
+    preflight = await run_migration_readiness_preflight(config)
+    logger.info(
+        "Migration readiness preflight: %s",
+        "PASS" if preflight.passed else "FAIL",
+    )
+    for item in preflight.checks:
+        logger.info("[preflight] %s", item)
+    for item in preflight.warnings:
+        logger.warning("[preflight] %s", item)
+    for item in preflight.failures:
+        logger.error("[preflight] %s", item)
 
     # -- Signal handlers ----------------------------------------------------
     loop = asyncio.get_running_loop()

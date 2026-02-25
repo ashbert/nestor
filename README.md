@@ -127,6 +127,7 @@ All configuration is via environment variables (or `.env` file). See [`.env.exam
 - If local DB exists but no Drive backup is found, Nestor forces an immediate startup backup.
 - If local `DATABASE_PATH` is missing at startup, Nestor will attempt to restore it from the Drive backup file before opening SQLite.
 - If no backup exists in Drive, Nestor starts with a fresh local DB.
+- On startup, Nestor logs a migration readiness preflight (`PASS`/`FAIL`) with permission and backup checks.
 
 ## Google Cloud Setup
 
