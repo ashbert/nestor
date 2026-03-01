@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -23,6 +24,22 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ROUNDS = 5
 _CONFIRMATION_TTL = timedelta(minutes=15)
+_RESEARCH_KEYWORDS = {
+    "look up",
+    "lookup",
+    "research",
+    "search",
+    "find",
+    "check",
+    "calendar",
+    "website",
+    "web",
+    "source",
+    "when does",
+    "date",
+    "schedule",
+    "school",
+}
 
 # Irreversible actions that require a simple yes/no confirmation
 _CONFIRM_TOOLS = {
@@ -104,6 +121,13 @@ class NestorBrain:
                 }
             )
         return results
+
+    @staticmethod
+    def _looks_like_research_request(message: str) -> bool:
+        text = re.sub(r"\s+", " ", message.lower()).strip()
+        if not text:
+            return False
+        return any(keyword in text for keyword in _RESEARCH_KEYWORDS)
 
     def _persist_exchange(
         self, user_id: int, user_name: str, user_message: str, assistant_message: str
@@ -239,18 +263,46 @@ class NestorBrain:
 
         messages = self._build_messages(user_id, user_name, message)
         tool_defs = self._tools.get_all_schemas()
+        research_request = self._looks_like_research_request(message)
 
         response: LLMResponse | None = None
         rounds = 0
+        retried_with_tool_nudge = False
 
         while rounds < _MAX_TOOL_ROUNDS:
             rounds += 1
-            response = await self._llm.chat(messages, tools=tool_defs or None)
+            force_tool_use = bool(
+                research_request
+                and tool_defs
+                and rounds == 1
+            )
+            response = await self._llm.chat(
+                messages,
+                tools=tool_defs or None,
+                force_tool_use=force_tool_use,
+            )
 
             # Append assistant turn to the running conversation.
             messages.append(self._assistant_message_from_response(response))
 
             if not response.tool_calls:
+                if (
+                    research_request
+                    and tool_defs
+                    and not retried_with_tool_nudge
+                    and rounds < _MAX_TOOL_ROUNDS
+                ):
+                    retried_with_tool_nudge = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Please use the available research tools before answering. "
+                                "Prefer official sources and provide exact dates when available."
+                            ),
+                        }
+                    )
+                    continue
                 break
 
             # Check if any tool calls need confirmation

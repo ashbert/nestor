@@ -64,6 +64,7 @@ class LLMProvider(abc.ABC):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        force_tool_use: bool = False,
     ) -> LLMResponse:
         """Send *messages* to the model and return a normalised response.
 
@@ -75,6 +76,9 @@ class LLMProvider(abc.ABC):
             native to the provider.
         tools:
             Optional list of tool definitions (JSON-Schema style).
+        force_tool_use:
+            When True (and tools are provided), require the model to produce
+            at least one tool call in this turn.
         """
 
 
@@ -193,6 +197,7 @@ class AnthropicProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        force_tool_use: bool = False,
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -203,6 +208,8 @@ class AnthropicProvider(LLMProvider):
             kwargs["system"] = self._system_prompt
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
+            if force_tool_use:
+                kwargs["tool_choice"] = {"type": "any"}
 
         response = await _retry(lambda: self._client.messages.create(**kwargs))
         return self._parse_response(response)
@@ -297,6 +304,7 @@ class OpenAIProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        force_tool_use: bool = False,
     ) -> LLMResponse:
         full_messages = self._build_messages(messages)
 
@@ -307,6 +315,8 @@ class OpenAIProvider(LLMProvider):
         }
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
+            if force_tool_use:
+                kwargs["tool_choice"] = "required"
 
         response = await _retry(
             lambda: self._client.chat.completions.create(**kwargs)
