@@ -25,7 +25,7 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-_MAX_PAGE_TEXT = 6000
+_MAX_PAGE_TEXT = 4000
 _HTTP_TIMEOUT = 20.0
 _MAX_REDIRECTS = 5
 _MAX_FETCH_BYTES = 2 * 1024 * 1024

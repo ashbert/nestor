@@ -22,7 +22,7 @@ from nestor.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-_MAX_TOOL_ROUNDS = 5
+_MAX_TOOL_ROUNDS = 8
 _CONFIRMATION_TTL = timedelta(minutes=15)
 _RESEARCH_KEYWORDS = {
     "look up",
@@ -93,7 +93,7 @@ class NestorBrain:
         message: str,
     ) -> list[dict[str, Any]]:
         """Load history and assemble the full message list."""
-        history_rows = self._memory.get_recent_messages(user_id, limit=50)
+        history_rows = self._memory.get_recent_messages(user_id, limit=30)
         messages: list[dict[str, Any]] = []
         for row in history_rows:
             messages.append({"role": row["role"], "content": row["content"]})
@@ -276,10 +276,12 @@ class NestorBrain:
                 and tool_defs
                 and rounds == 1
             )
+            # On the last round, don't offer tools so the LLM must produce text.
+            last_round = rounds == _MAX_TOOL_ROUNDS
             response = await self._llm.chat(
                 messages,
-                tools=tool_defs or None,
-                force_tool_use=force_tool_use,
+                tools=(tool_defs or None) if not last_round else None,
+                force_tool_use=force_tool_use if not last_round else False,
             )
 
             # Append assistant turn to the running conversation.
@@ -290,7 +292,7 @@ class NestorBrain:
                     research_request
                     and tool_defs
                     and not retried_with_tool_nudge
-                    and rounds < _MAX_TOOL_ROUNDS
+                    and rounds < _MAX_TOOL_ROUNDS - 1
                 ):
                     retried_with_tool_nudge = True
                     messages.append(
@@ -317,9 +319,18 @@ class NestorBrain:
             tool_results = await self._execute_tool_calls(response.tool_calls)
             messages.extend(tool_results)
 
-        final_text = (response.text if response else None) or (
-            "I do beg your pardon — I seem to have lost my train of thought."
-        )
+        final_text = response.text if response else None
+        if not final_text:
+            logger.warning(
+                "Agentic loop finished after %d rounds with no text response "
+                "(user_id=%s, message=%r)",
+                rounds,
+                user_id,
+                message[:100],
+            )
+            final_text = (
+                "I do beg your pardon — I seem to have lost my train of thought."
+            )
 
         self._persist_exchange(user_id, user_name, message, final_text)
 
