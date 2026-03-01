@@ -211,7 +211,7 @@ class NestorBrain:
 
         if self._is_no_message(message):
             self._memory.delete_pending_action(user_id)
-            reply = "Very good, Sir. I've discarded that."
+            reply = "Very good, Sir. Consider it banished to the void — along with the Captain's last attempt at soufflé."
             self._persist_exchange(user_id, user_name, message, reply)
             return reply
 
@@ -329,7 +329,9 @@ class NestorBrain:
                 message[:100],
             )
             final_text = (
-                "I do beg your pardon — I seem to have lost my train of thought."
+                "I do beg your pardon — I appear to have wandered into "
+                "the mental equivalent of a broom cupboard. Might I "
+                "trouble you to rephrase the request?"
             )
 
         self._persist_exchange(user_id, user_name, message, final_text)
