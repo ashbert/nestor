@@ -27,6 +27,7 @@ from nestor.llm import create_provider
 from nestor.brain import NestorBrain
 from nestor.preflight import run_migration_readiness_preflight
 from nestor.tools import ToolRegistry
+from nestor.slack_handler import create_slack_socket_runtime, SlackSocketRuntime
 from nestor.tools.datetime_tool import GetCurrentDateTimeTool
 from nestor.telegram_handler import create_bot
 
@@ -244,40 +245,83 @@ async def _run() -> None:
     assert api_key, "API key missing (should have been caught by validate)"
 
     system_prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-    llm = create_provider(
+    llm_deep = create_provider(
         provider=config.llm_provider,
         api_key=api_key,
-        model=config.llm_model,
+        model=config.llm_model_deep or config.llm_model,
         system_prompt=system_prompt,
     )
-    logger.info("LLM: %s / %s", config.llm_provider, config.llm_model)
+    llm_fast = llm_deep
+    fast_model_name = config.llm_model_fast or config.llm_model_deep or config.llm_model
+    deep_model_name = config.llm_model_deep or config.llm_model
+    if fast_model_name != deep_model_name:
+        llm_fast = create_provider(
+            provider=config.llm_provider,
+            api_key=api_key,
+            model=fast_model_name,
+            system_prompt=system_prompt,
+        )
+    logger.info(
+        "LLM: provider=%s fast=%s deep=%s",
+        config.llm_provider,
+        fast_model_name,
+        deep_model_name,
+    )
 
     # -- Tools --------------------------------------------------------------
     tools = _register_tools(config, memory)
 
     # -- Brain --------------------------------------------------------------
     brain = NestorBrain(
-        llm=llm,
+        llm=llm_deep,
+        llm_fast=llm_fast,
+        llm_deep=llm_deep,
         tool_registry=tools,
         memory=memory,
         system_prompt=system_prompt,
+        channel_model_overrides=config.channel_model_overrides,
+        enable_parallel_research=config.enable_parallel_research,
     )
 
-    # -- Telegram bot -------------------------------------------------------
-    allowed_ids = set(config.allowed_telegram_ids)
+    # -- Transports ---------------------------------------------------------
+    telegram_app = None
+    slack_runtime: SlackSocketRuntime | None = None
 
-    app = create_bot(
-        token=config.telegram_bot_token,
-        allowed_ids=allowed_ids,
-        message_handler=brain.handle_message,
-        today_handler=brain.get_today_summary,
-        week_handler=brain.get_week_summary,
-    )
+    if config.telegram_bot_token and config.allowed_telegram_ids:
+        allowed_ids = set(config.allowed_telegram_ids)
+        telegram_app = create_bot(
+            token=config.telegram_bot_token,
+            allowed_ids=allowed_ids,
+            message_handler=lambda user_id, user_name, text: brain.handle_message(
+                user_id,
+                user_name,
+                text,
+                {"source": "telegram"},
+            ),
+            today_handler=brain.get_today_summary,
+            week_handler=brain.get_week_summary,
+        )
+        await telegram_app.initialize()
+        await telegram_app.start()
+        await telegram_app.updater.start_polling(drop_pending_updates=True)  # type: ignore[union-attr]
+        logger.info("Telegram polling started.")
+    else:
+        logger.info("Telegram transport disabled (missing token or allowlist)")
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)  # type: ignore[union-attr]
-    logger.info("Telegram polling started – Nestor is ready.")
+    if config.slack_bot_token and config.slack_app_token:
+        slack_runtime = create_slack_socket_runtime(
+            bot_token=config.slack_bot_token,
+            app_token=config.slack_app_token,
+            allowed_user_ids=set(config.allowed_slack_user_ids),
+            allowed_channel_ids=set(config.allowed_slack_channel_ids),
+            require_mention=config.slack_require_mention,
+            allow_thread_followups=config.slack_allow_thread_followups,
+            message_handler=brain.handle_message,
+        )
+        await slack_runtime.start()
+        logger.info("Slack Socket Mode started.")
+    else:
+        logger.info("Slack transport disabled (missing bot/app token)")
 
     backup_task: asyncio.Task[None] | None = None
     if config.db_backup_to_drive:
@@ -338,10 +382,15 @@ async def _run() -> None:
     await _shutdown_event.wait()
 
     # Graceful teardown
-    logger.info("Stopping Telegram polling…")
-    await app.updater.stop()  # type: ignore[union-attr]
-    await app.stop()
-    await app.shutdown()
+    if telegram_app is not None:
+        logger.info("Stopping Telegram polling…")
+        await telegram_app.updater.stop()  # type: ignore[union-attr]
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+    if slack_runtime is not None:
+        logger.info("Stopping Slack Socket Mode…")
+        await slack_runtime.stop()
 
     if backup_task:
         try:
