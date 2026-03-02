@@ -1,10 +1,10 @@
-# Nestor — Your Private Family Butler on Telegram
+# Nestor — Your Private Family Butler (Telegram + Slack)
 
 <p align="center"><em>"Very good, Sir. I shall attend to it at once."</em></p>
 
-Nestor is a private, self-hosted Telegram bot that acts as a shared family assistant. Inspired by the unflappable butler from Tintin's Marlinspike Hall, he manages your calendar, sends emails, researches things on the web, and keeps notes — all through natural conversation.
+Nestor is a private, self-hosted family assistant for Telegram and Slack. Inspired by the unflappable butler from Tintin's Marlinspike Hall, he manages your calendar, sends emails, researches things on the web, and keeps notes — all through natural conversation.
 
-Deploy him on any VPS. Only whitelisted family members can interact with him. Everyone else is silently ignored.
+Deploy him on any VPS. Only whitelisted users can interact with him. Everyone else is silently ignored.
 
 ---
 
@@ -33,18 +33,19 @@ Nestor uses tool-calling AI (Anthropic Claude or OpenAI GPT-4) to understand req
 ## Architecture
 
 ```
-Telegram → Whitelist Gate → LLM Brain (agentic tool-calling loop)
-                                │
-                    ┌───────────┴────────────┐
-                    │                        │
-            Google Calendar       Google Drive/Docs
-            Gmail (SMTP/IMAP)     Web Search
-            DateTime              SQLite Memory
+Telegram / Slack → Whitelist Gate → LLM Brain (agentic tool-calling loop)
+                                    │
+                        ┌───────────┴────────────┐
+                        │                        │
+                Google Calendar       Google Drive/Docs
+                Gmail (SMTP/IMAP)     Web Search/PDF Parse
+                DateTime              SQLite Memory
 ```
 
 **Key design choices:**
 - **Composable tools** — each capability is a self-contained `BaseTool` subclass. Add new tools in minutes.
 - **Provider-agnostic LLM** — swap between Anthropic and OpenAI with one env var.
+- **Cost-aware routing** — automatic fast/deep model tier selection with optional per-channel overrides.
 - **Portable** — Docker, docker-compose, or systemd. All config via environment variables.
 - **Zero secrets in code** — everything from `.env` or env vars. Git history is clean.
 - **Private by default** — Telegram user ID whitelist. Silent rejection of strangers.
@@ -52,7 +53,7 @@ Telegram → Whitelist Gate → LLM Brain (agentic tool-calling loop)
 ## Prerequisites
 
 - Python 3.12+ (or Docker)
-- A Telegram Bot token ([create one via @BotFather](https://t.me/BotFather))
+- A Telegram Bot token ([create one via @BotFather](https://t.me/BotFather)) and/or a Slack app (Socket Mode)
 - An Anthropic or OpenAI API key
 - A Gmail account for Nestor (for calendar, drive, and email)
 - A Google Cloud project with Calendar, Drive, and Docs APIs enabled
@@ -102,9 +103,19 @@ All configuration is via environment variables (or `.env` file). See [`.env.exam
 
 | Variable | Required | Description |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Yes | From @BotFather |
-| `ALLOWED_TELEGRAM_IDS` | Yes | Comma-separated Telegram user IDs |
+| `TELEGRAM_BOT_TOKEN` | If using Telegram | From @BotFather |
+| `ALLOWED_TELEGRAM_IDS` | If using Telegram | Comma-separated Telegram user IDs |
+| `SLACK_BOT_TOKEN` | If using Slack | Slack bot token (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | If using Slack | Slack app-level token (`xapp-...`) for Socket Mode |
+| `ALLOWED_SLACK_USER_IDS` | If using Slack | Comma-separated Slack user IDs allowed to interact |
+| `ALLOWED_SLACK_CHANNEL_IDS` | No | Optional comma-separated Slack channel allowlist |
+| `SLACK_REQUIRE_MENTION` | No | Require @mention in channels (default: `true`) |
+| `SLACK_ALLOW_THREAD_FOLLOWUPS` | No | Allow no-mention followups in active bot threads (default: `true`) |
 | `LLM_PROVIDER` | No | `anthropic` (default) or `openai` |
+| `LLM_MODEL_FAST` | No | Fast/cheap tier model (provider default if unset) |
+| `LLM_MODEL_DEEP` | No | Deep/reasoning tier model (provider default if unset) |
+| `CHANNEL_MODEL_OVERRIDES` | No | JSON map of channel ID → `fast`/`deep` |
+| `ENABLE_PARALLEL_RESEARCH` | No | Enable bounded parallel research prefetch (default: `true`) |
 | `ANTHROPIC_API_KEY` | If using Anthropic | API key |
 | `OPENAI_API_KEY` | If using OpenAI | API key |
 | `GMAIL_ADDRESS` | For email | Nestor's Gmail address |
@@ -150,6 +161,12 @@ Nestor uses SMTP/IMAP with a Gmail App Password (no Google Cloud API needed for 
 
 Message [@userinfobot](https://t.me/userinfobot) on Telegram. It replies with your numeric user ID. Add all family members' IDs (comma-separated) to `ALLOWED_TELEGRAM_IDS`.
 
+## Getting Slack IDs
+
+- User IDs: open Slack profile → "Copy member ID" (format `U...`).
+- Channel IDs: open channel details → copy channel ID (format `C...`).
+- Add IDs to `ALLOWED_SLACK_USER_IDS` and optionally `ALLOWED_SLACK_CHANNEL_IDS`.
+
 ## Adding New Tools
 
 Create a file in `nestor/tools/` and subclass `BaseTool`:
@@ -184,6 +201,7 @@ nestor/
 ├── nestor/
 │   ├── config.py                # Env-based configuration
 │   ├── telegram_handler.py      # Telegram bot + whitelist
+│   ├── slack_handler.py         # Slack Socket Mode + allowlists
 │   ├── brain.py                 # Agentic loop (LLM + tools + memory)
 │   ├── llm.py                   # Anthropic & OpenAI abstraction
 │   ├── memory.py                # SQLite conversation history
@@ -208,10 +226,10 @@ nestor/
 ## Security
 
 - All secrets in `.env` (gitignored) — never in source code
-- Telegram whitelist uses immutable numeric user IDs
+- Telegram and Slack allowlists use immutable platform user IDs
 - Strangers are silently ignored — the bot's existence is never revealed
 - Google OAuth tokens stored locally with `600` permissions
-- No inbound ports required — Telegram uses long-polling
+- No inbound ports required — Telegram long-polling and Slack Socket Mode supported
 - Git history contains zero secrets or PII
 
 ## License
