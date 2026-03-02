@@ -7,10 +7,12 @@ back, and persists the exchange.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -40,6 +42,33 @@ _RESEARCH_KEYWORDS = {
     "schedule",
     "school",
 }
+_DEEP_KEYWORDS = {
+    "deep research",
+    "travel plan",
+    "itinerary",
+    "summer camp",
+    "camp planning",
+    "pantry",
+    "fridge",
+    "shopping list",
+    "dinner",
+    "analyze",
+    "analysis",
+    "compare options",
+    "compare",
+    "opinion on previous conversations",
+    "previous conversations",
+    "multi model",
+}
+_PARALLEL_RESEARCH_HINTS = {
+    "deep research",
+    "multi source",
+    "compare sources",
+    "travel",
+    "camp",
+    "school calendar",
+}
+_URL_RE = re.compile(r"https?://[^\s)>\"]+")
 
 # Irreversible actions that require a simple yes/no confirmation
 _CONFIRM_TOOLS = {
@@ -64,11 +93,19 @@ class NestorBrain:
         tool_registry: ToolRegistry,
         memory: MemoryStore,
         system_prompt: str,
+        llm_fast: LLMProvider | None = None,
+        llm_deep: LLMProvider | None = None,
+        channel_model_overrides: dict[str, str] | None = None,
+        enable_parallel_research: bool = True,
     ) -> None:
         self._llm = llm
+        self._llm_fast = llm_fast or llm
+        self._llm_deep = llm_deep or llm
         self._tools = tool_registry
         self._memory = memory
         self._system_prompt = system_prompt
+        self._channel_model_overrides = channel_model_overrides or {}
+        self._enable_parallel_research = enable_parallel_research
         # Pending actions are now persisted in SQLite via self._memory
 
     # ------------------------------------------------------------------
@@ -128,6 +165,158 @@ class NestorBrain:
         if not text:
             return False
         return any(keyword in text for keyword in _RESEARCH_KEYWORDS)
+
+    @staticmethod
+    def _looks_like_deep_request(message: str) -> bool:
+        text = re.sub(r"\s+", " ", message.lower()).strip()
+        if not text:
+            return False
+        if any(keyword in text for keyword in _DEEP_KEYWORDS):
+            return True
+        return len(text) >= 260
+
+    @staticmethod
+    def _wants_parallel_research(message: str) -> bool:
+        text = re.sub(r"\s+", " ", message.lower()).strip()
+        if not text:
+            return False
+        return any(keyword in text for keyword in _PARALLEL_RESEARCH_HINTS)
+
+    def _provider_label(self, provider: LLMProvider) -> str:
+        if provider is self._llm_fast:
+            return "fast"
+        if provider is self._llm_deep:
+            return "deep"
+        return "default"
+
+    def _select_llm(
+        self, message: str, context: dict[str, str] | None
+    ) -> LLMProvider:
+        channel_id = (context or {}).get("channel_id", "")
+        override = self._channel_model_overrides.get(channel_id, "").strip().lower()
+        if override in {"fast", "cheap", "quick"}:
+            return self._llm_fast
+        if override in {"deep", "quality", "research"}:
+            return self._llm_deep
+
+        if self._looks_like_deep_request(message):
+            return self._llm_deep
+
+        if self._looks_like_research_request(message):
+            return self._llm_fast
+
+        return self._llm_fast
+
+    @staticmethod
+    def _derive_research_queries(message: str) -> list[str]:
+        text = re.sub(r"\s+", " ", message).strip()
+        if not text:
+            return []
+        queries = [text]
+        lower = text.lower()
+        if "school" in lower and "calendar" in lower:
+            queries.append(f"{text} official district calendar")
+            queries.append(f"{text} pdf")
+        elif "travel" in lower:
+            queries.append(f"{text} official tourism board")
+            queries.append(f"{text} family itinerary ideas")
+        else:
+            queries.append(f"{text} official source")
+            queries.append(f"{text} latest update")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for q in queries:
+            qn = q.strip()
+            if not qn:
+                continue
+            key = qn.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(qn)
+        return deduped[:3]
+
+    @staticmethod
+    def _extract_urls(text: str, *, limit: int = 4) -> list[str]:
+        if not text:
+            return []
+        urls: list[str] = []
+        seen: set[str] = set()
+        for match in _URL_RE.findall(text):
+            url = match.rstrip(".,;")
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if not parsed.netloc:
+                continue
+            key = url.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            urls.append(url)
+            if len(urls) >= limit:
+                break
+        return urls
+
+    async def _build_parallel_research_brief(self, message: str) -> str | None:
+        if "web_search" not in self._tools or "fetch_web_page" not in self._tools:
+            return None
+
+        queries = self._derive_research_queries(message)
+        if not queries:
+            return None
+
+        search_calls = [
+            self._tools.execute(
+                "web_search",
+                {"query": query, "num_results": 6},
+            )
+            for query in queries
+        ]
+        search_results = await asyncio.gather(*search_calls, return_exceptions=True)
+
+        candidate_urls: list[str] = []
+        lines = ["Parallel research workers gathered the following:"]
+        for query, result in zip(queries, search_results):
+            if isinstance(result, Exception):
+                lines.append(f"- Search error for '{query}': {result}")
+                continue
+            result_text = str(result)
+            lines.append(f"- Query: {query}")
+            urls = self._extract_urls(result_text, limit=3)
+            candidate_urls.extend(urls)
+            for url in urls:
+                lines.append(f"  - {url}")
+
+        unique_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for url in candidate_urls:
+            key = url.lower()
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            unique_urls.append(url)
+        unique_urls = unique_urls[:4]
+
+        if unique_urls:
+            fetch_calls = [
+                self._tools.execute("fetch_web_page", {"url": url})
+                for url in unique_urls
+            ]
+            fetch_results = await asyncio.gather(*fetch_calls, return_exceptions=True)
+            for url, fetched in zip(unique_urls, fetch_results):
+                if isinstance(fetched, Exception):
+                    lines.append(f"- Fetch error: {url} ({fetched})")
+                    continue
+                text = str(fetched).strip()
+                if len(text) > 900:
+                    text = text[:900] + "\n[...truncated]"
+                lines.append(f"- Fetched: {url}\n{text}")
+
+        if len(lines) <= 1:
+            return None
+        return "\n".join(lines)
 
     def _persist_exchange(
         self, user_id: int, user_name: str, user_message: str, assistant_message: str
@@ -246,7 +435,11 @@ class NestorBrain:
     # ------------------------------------------------------------------
 
     async def handle_message(
-        self, user_id: int, user_name: str, message: str
+        self,
+        user_id: int,
+        user_name: str,
+        message: str,
+        context: dict[str, str] | None = None,
     ) -> str:
         """Process a user message through the full agentic loop.
 
@@ -258,12 +451,37 @@ class NestorBrain:
         if confirmation_reply is not None:
             return confirmation_reply
 
-        # Inject live datetime into the system prompt for this turn.
-        self._llm.system_prompt = self._inject_datetime(self._system_prompt)
+        llm = self._select_llm(message, context)
+        llm.system_prompt = self._inject_datetime(self._system_prompt)
+        logger.info(
+            "Selected model tier for message: %s (source=%s, channel=%s)",
+            self._provider_label(llm),
+            (context or {}).get("source", "default"),
+            (context or {}).get("channel_id", ""),
+        )
 
         messages = self._build_messages(user_id, user_name, message)
         tool_defs = self._tools.get_all_schemas()
         research_request = self._looks_like_research_request(message)
+        escalated_to_deep = False
+
+        if self._enable_parallel_research and self._wants_parallel_research(message):
+            try:
+                brief = await self._build_parallel_research_brief(message)
+            except Exception:
+                logger.exception("Parallel research prefetch failed")
+                brief = None
+            if brief:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Reference dossier from internal research workers:\n"
+                            f"{brief}\n\n"
+                            "Use this as evidence, verify with tools as needed, and cite sources."
+                        ),
+                    }
+                )
 
         response: LLMResponse | None = None
         rounds = 0
@@ -278,7 +496,7 @@ class NestorBrain:
             )
             # On the last round, don't offer tools so the LLM must produce text.
             last_round = rounds == _MAX_TOOL_ROUNDS
-            response = await self._llm.chat(
+            response = await llm.chat(
                 messages,
                 tools=(tool_defs or None) if not last_round else None,
                 force_tool_use=force_tool_use if not last_round else False,
@@ -288,6 +506,27 @@ class NestorBrain:
             messages.append(self._assistant_message_from_response(response))
 
             if not response.tool_calls:
+                if (
+                    research_request
+                    and not escalated_to_deep
+                    and llm is self._llm_fast
+                    and self._llm_deep is not self._llm_fast
+                    and rounds < _MAX_TOOL_ROUNDS - 1
+                ):
+                    escalated_to_deep = True
+                    llm = self._llm_deep
+                    llm.system_prompt = self._inject_datetime(self._system_prompt)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Escalate this request to a deeper reasoning pass. "
+                                "Use tools where needed and provide source-backed conclusions."
+                            ),
+                        }
+                    )
+                    logger.info("Escalated conversation to deep model tier")
+                    continue
                 if (
                     research_request
                     and tool_defs
