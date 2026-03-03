@@ -147,5 +147,12 @@ def create_slack_socket_runtime(
         except Exception:
             logger.exception("Slack message dispatch failed")
 
+    @app.event("app_mention")
+    async def _on_app_mention(event, say, logger):  # type: ignore[no-untyped-def]
+        try:
+            await _dispatch(event, say)
+        except Exception:
+            logger.exception("Slack app_mention dispatch failed")
+
     handler = AsyncSocketModeHandler(app, app_token)
     return SlackSocketRuntime(app=app, handler=handler)
