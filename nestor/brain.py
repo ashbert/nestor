@@ -32,15 +32,33 @@ _RESEARCH_KEYWORDS = {
     "research",
     "search",
     "find",
-    "check",
-    "calendar",
     "website",
     "web",
     "source",
+    "official source",
     "when does",
-    "date",
-    "schedule",
-    "school",
+}
+
+_ACTION_INTENT_KEYWORDS = {
+    " add ",
+    " create ",
+    " schedule ",
+    " reschedule ",
+    " move ",
+    " delete ",
+    " remove ",
+    " cancel ",
+    " update ",
+}
+
+_ACTION_TARGET_KEYWORDS = {
+    " calendar",
+    " event",
+    " appointment",
+    " meeting",
+    " reminder",
+    " recurring",
+    " every week",
 }
 _DEEP_KEYWORDS = {
     "deep research",
@@ -165,6 +183,16 @@ class NestorBrain:
         if not text:
             return False
         return any(keyword in text for keyword in _RESEARCH_KEYWORDS)
+
+    @staticmethod
+    def _looks_like_action_request(message: str) -> bool:
+        text = f" {re.sub(r'\s+', ' ', message.lower()).strip()} "
+        if not text.strip():
+            return False
+        has_action_intent = any(keyword in text for keyword in _ACTION_INTENT_KEYWORDS)
+        if not has_action_intent:
+            return False
+        return any(keyword in text for keyword in _ACTION_TARGET_KEYWORDS)
 
     @staticmethod
     def _looks_like_deep_request(message: str) -> bool:
@@ -462,7 +490,10 @@ class NestorBrain:
 
         messages = self._build_messages(user_id, user_name, message)
         tool_defs = self._tools.get_all_schemas()
-        research_request = self._looks_like_research_request(message)
+        action_request = self._looks_like_action_request(message)
+        research_request = self._looks_like_research_request(message) and not action_request
+        if action_request and self._looks_like_research_request(message):
+            logger.info("Research forcing suppressed due to action-oriented request")
         escalated_to_deep = False
 
         if self._enable_parallel_research and self._wants_parallel_research(message):
