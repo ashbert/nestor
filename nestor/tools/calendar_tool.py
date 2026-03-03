@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from datetime import datetime, timedelta
@@ -70,6 +71,29 @@ def _format_event(event: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _event_dedup_fingerprint(
+    *,
+    title: str,
+    date: str,
+    start_time: str | None,
+    end_time: str | None,
+    description: str,
+    all_day: bool,
+) -> str:
+    """Build a stable fingerprint for idempotent event creation."""
+    normalized = "|".join(
+        [
+            title.strip().lower(),
+            date.strip(),
+            (start_time or "").strip(),
+            (end_time or "").strip(),
+            description.strip().lower(),
+            "all_day" if all_day else "timed",
+        ]
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -109,6 +133,10 @@ class CreateEventTool(BaseTool):
                 "type": "boolean",
                 "description": "If true, create an all-day event (default false).",
             },
+            "allow_duplicate": {
+                "type": "boolean",
+                "description": "If true, bypass duplicate detection and force creation (default false).",
+            },
         },
         "required": ["title", "date"],
     }
@@ -124,24 +152,74 @@ class CreateEventTool(BaseTool):
         end_time: str | None = kwargs.get("end_time")
         description: str = kwargs.get("description", "")
         all_day: bool = kwargs.get("all_day", False)
+        allow_duplicate: bool = kwargs.get("allow_duplicate", False)
 
         try:
             body: dict[str, Any] = {"summary": title}
             if description:
                 body["description"] = description
 
+            tz_name = os.environ.get("NESTOR_TIMEZONE", "America/Los_Angeles")
+            tz = ZoneInfo(tz_name)
+            day_start = datetime.strptime(date, "%Y-%m-%d").replace(
+                hour=0,
+                minute=0,
+                second=0,
+                tzinfo=tz,
+            )
+            day_end = day_start + timedelta(days=1)
+
             if all_day or (not start_time and not end_time):
                 # All-day event: end date is exclusive, so add 1 day.
-                start_date = datetime.strptime(date, "%Y-%m-%d").date()
-                end_date = start_date + timedelta(days=1)
+                start_date = day_start.date()
+                end_date = day_end.date()
                 body["start"] = {"date": str(start_date)}
                 body["end"] = {"date": str(end_date)}
             else:
                 st = start_time or "09:00"
                 et = end_time or _default_end(st)
-                tz = os.environ.get("NESTOR_TIMEZONE", "America/Los_Angeles")
-                body["start"] = {"dateTime": f"{date}T{st}:00", "timeZone": tz}
-                body["end"] = {"dateTime": f"{date}T{et}:00", "timeZone": tz}
+                body["start"] = {"dateTime": f"{date}T{st}:00", "timeZone": tz_name}
+                body["end"] = {"dateTime": f"{date}T{et}:00", "timeZone": tz_name}
+
+            time_min = day_start.isoformat()
+            time_max = day_end.isoformat()
+
+            fingerprint = _event_dedup_fingerprint(
+                title=title,
+                date=date,
+                start_time=start_time,
+                end_time=end_time,
+                description=description,
+                all_day=all_day,
+            )
+            body.setdefault("extendedProperties", {}).setdefault("private", {})[
+                "nestor_dedup"
+            ] = fingerprint
+
+            if not allow_duplicate:
+                existing = await _run_sync(
+                    self._service.events()
+                    .list(
+                        calendarId=self._calendar_id,
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        q=title,
+                        maxResults=25,
+                    )
+                    .execute
+                )
+                for item in existing.get("items", []):
+                    props = (
+                        item.get("extendedProperties", {})
+                        .get("private", {})
+                    )
+                    if props.get("nestor_dedup") == fingerprint:
+                        return (
+                            "Duplicate avoided: matching event already exists. "
+                            f"Event ID: {item.get('id')}. "
+                            f"Link: {item.get('htmlLink', 'N/A')}"
+                        )
 
             event = await _run_sync(
                 self._service.events()
