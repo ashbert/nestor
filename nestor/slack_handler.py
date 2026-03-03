@@ -33,6 +33,13 @@ def _thread_key(channel_id: str, thread_ts: str) -> str:
     return f"{channel_id}:{thread_ts}"
 
 
+def _obfuscated(value: str) -> str:
+    """Return a short, stable, non-reversible token for logs."""
+    if not value:
+        return "-"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
 @dataclass
 class SlackSocketRuntime:
     """Runtime container for a Slack Socket Mode app."""
@@ -75,23 +82,54 @@ def create_slack_socket_runtime(
         return user_id
 
     async def _dispatch(event: dict, say) -> None:
+        event_type = str(event.get("type") or "")
+
         if event.get("bot_id") or event.get("subtype"):
+            logger.debug(
+                "Slack event ignored: bot/subtype (event=%s, subtype=%s)",
+                event_type or "-",
+                str(event.get("subtype") or "-"),
+            )
             return
 
         user_id = str(event.get("user") or "")
         channel_id = str(event.get("channel") or "")
         if not user_id or not channel_id:
+            logger.debug(
+                "Slack event ignored: missing user/channel (event=%s, user=%s, channel=%s)",
+                event_type or "-",
+                _obfuscated(user_id),
+                _obfuscated(channel_id),
+            )
             return
 
         if user_id not in allowed_user_ids:
+            logger.info(
+                "Slack event denied: user not allowlisted (event=%s, user=%s, channel=%s)",
+                event_type or "-",
+                _obfuscated(user_id),
+                _obfuscated(channel_id),
+            )
             return
 
         is_dm = _is_dm_channel(channel_id)
         if not is_dm and allowed_channel_ids and channel_id not in allowed_channel_ids:
+            logger.info(
+                "Slack event denied: channel not allowlisted (event=%s, user=%s, channel=%s)",
+                event_type or "-",
+                _obfuscated(user_id),
+                _obfuscated(channel_id),
+            )
             return
 
         text = str(event.get("text") or "").strip()
         if not text:
+            logger.debug(
+                "Slack event ignored: empty text (event=%s, user=%s, channel=%s)",
+                event_type or "-",
+                _obfuscated(user_id),
+                _obfuscated(channel_id),
+            )
             return
 
         thread_ts = str(event.get("thread_ts") or "")
@@ -107,6 +145,12 @@ def create_slack_socket_runtime(
         )
 
         if not is_dm and require_mention and not mentioned and not thread_is_active:
+            logger.debug(
+                "Slack event ignored: mention required (event=%s, user=%s, channel=%s)",
+                event_type or "-",
+                _obfuscated(user_id),
+                _obfuscated(channel_id),
+            )
             return
 
         if mentioned and bot_user_id:
