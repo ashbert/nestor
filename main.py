@@ -98,6 +98,7 @@ def _register_tools(config: Config, memory: MemoryStore) -> ToolRegistry:
             )
             cal_service = build_calendar_service(creds_file, token_file)
             cal_id = config.google_calendar_id
+            # Prefer deterministic calendar tools before broad web research.
             registry.register(CreateEventTool(cal_service, cal_id))
             registry.register(ListEventsTool(cal_service, cal_id))
             registry.register(DeleteEventTool(cal_service, cal_id))

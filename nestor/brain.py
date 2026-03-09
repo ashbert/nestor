@@ -31,12 +31,23 @@ _RESEARCH_KEYWORDS = {
     "lookup",
     "research",
     "search",
-    "find",
     "website",
     "web",
     "source",
     "official source",
     "when does",
+}
+
+_CALENDAR_TROUBLESHOOT_HINTS = {
+    "could not find this event",
+    "couldn't find this event",
+    "cant find this event",
+    "can't find this event",
+    "cannot find this event",
+    "not seeing this event",
+    "don't see this event",
+    "dont see this event",
+    "where is this event",
 }
 
 _ACTION_INTENT_KEYWORDS = {
@@ -181,6 +192,10 @@ class NestorBrain:
     def _looks_like_research_request(message: str) -> bool:
         text = re.sub(r"\s+", " ", message.lower()).strip()
         if not text:
+            return False
+        # "find" in troubleshooting follow-ups like "could not find this event"
+        # should not force the research workflow.
+        if any(hint in text for hint in _CALENDAR_TROUBLESHOOT_HINTS):
             return False
         return any(keyword in text for keyword in _RESEARCH_KEYWORDS)
 
@@ -525,6 +540,10 @@ class NestorBrain:
                 and tool_defs
                 and rounds == 1
             )
+            if research_request and rounds > 1:
+                # Once a non-research action tool runs (e.g., calendar create),
+                # avoid drifting into web research in later rounds.
+                force_tool_use = False
             # On the last round, don't offer tools so the LLM must produce text.
             last_round = rounds == _MAX_TOOL_ROUNDS
             response = await llm.chat(
