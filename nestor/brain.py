@@ -98,6 +98,22 @@ _PARALLEL_RESEARCH_HINTS = {
     "school calendar",
 }
 _URL_RE = re.compile(r"https?://[^\s)>\"]+")
+_CALENDAR_DATE_HINT_RE = re.compile(
+    r"\b("
+    r"today|tomorrow|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    r")\b"
+)
+_CALENDAR_TIME_HINT_RE = re.compile(
+    r"\b("
+    r"\d{1,2}:\d{2}\s*(?:am|pm)?|"
+    r"\d{1,2}\s*(?:am|pm)|"
+    r"between\s+\d"
+    r")\b"
+)
 
 # Irreversible actions that require a simple yes/no confirmation
 _CONFIRM_TOOLS = {
@@ -208,6 +224,30 @@ class NestorBrain:
         if not has_action_intent:
             return False
         return any(keyword in text for keyword in _ACTION_TARGET_KEYWORDS)
+
+    @staticmethod
+    def _looks_like_calendar_create_request(message: str) -> bool:
+        text = re.sub(r"\s+", " ", message.lower()).strip()
+        if not text:
+            return False
+
+        action_terms = (
+            "calendar",
+            "add",
+            "schedule",
+            "create",
+            "appointment",
+            "meeting",
+            "event",
+        )
+        has_action = any(term in text for term in action_terms)
+        if not has_action:
+            return False
+
+        has_date_or_time = bool(
+            _CALENDAR_DATE_HINT_RE.search(text) or _CALENDAR_TIME_HINT_RE.search(text)
+        )
+        return has_date_or_time
 
     @staticmethod
     def _looks_like_deep_request(message: str) -> bool:
@@ -506,10 +546,12 @@ class NestorBrain:
         messages = self._build_messages(user_id, user_name, message)
         tool_defs = self._tools.get_all_schemas()
         action_request = self._looks_like_action_request(message)
+        calendar_action_request = self._looks_like_calendar_create_request(message)
         research_request = self._looks_like_research_request(message) and not action_request
         if action_request and self._looks_like_research_request(message):
             logger.info("Research forcing suppressed due to action-oriented request")
         escalated_to_deep = False
+        executed_tool_names: set[str] = set()
 
         if self._enable_parallel_research and self._wants_parallel_research(message):
             try:
@@ -562,6 +604,10 @@ class NestorBrain:
                     and llm is self._llm_fast
                     and self._llm_deep is not self._llm_fast
                     and rounds < _MAX_TOOL_ROUNDS - 1
+                    and not (
+                        calendar_action_request
+                        and "create_calendar_event" in executed_tool_names
+                    )
                 ):
                     escalated_to_deep = True
                     llm = self._llm_deep
@@ -606,6 +652,7 @@ class NestorBrain:
 
             # Execute tools and feed results back.
             tool_results = await self._execute_tool_calls(response.tool_calls)
+            executed_tool_names.update(tc.name for tc in response.tool_calls)
             messages.extend(tool_results)
 
         final_text = response.text if response else None
