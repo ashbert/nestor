@@ -14,7 +14,7 @@ import os
 import re
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -114,6 +114,15 @@ _CALENDAR_TIME_HINT_RE = re.compile(
     r"between\s+\d"
     r")\b"
 )
+_DAY_NAME_TO_WEEKDAY = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
 
 # Irreversible actions that require a simple yes/no confirmation
 _CONFIRM_TOOLS = {
@@ -248,6 +257,86 @@ class NestorBrain:
             _CALENDAR_DATE_HINT_RE.search(text) or _CALENDAR_TIME_HINT_RE.search(text)
         )
         return has_date_or_time
+
+    @staticmethod
+    def _is_calendar_troubleshooting_followup(message: str) -> bool:
+        text = re.sub(r"\s+", " ", message.lower()).strip()
+        if not text:
+            return False
+        return any(hint in text for hint in _CALENDAR_TROUBLESHOOT_HINTS)
+
+    def _resolve_date_hint(self, message: str) -> str | None:
+        text = re.sub(r"\s+", " ", message.lower()).strip()
+        if not text:
+            return None
+
+        tz_name = os.environ.get("NESTOR_TIMEZONE", "America/Los_Angeles")
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("America/Los_Angeles")
+        today = datetime.now(tz=tz).date()
+
+        if "today" in text:
+            return today.isoformat()
+        if "tomorrow" in text:
+            return (today + timedelta(days=1)).isoformat()
+
+        for name, weekday in _DAY_NAME_TO_WEEKDAY.items():
+            if name not in text:
+                continue
+            days_ahead = (weekday - today.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            return (today + timedelta(days=days_ahead)).isoformat()
+
+        iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        if iso_match:
+            return iso_match.group(1)
+
+        md_match = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", text)
+        if md_match:
+            month = int(md_match.group(1))
+            day = int(md_match.group(2))
+            year_part = md_match.group(3)
+            year = today.year
+            if year_part:
+                year = int(year_part)
+                if year < 100:
+                    year += 2000
+            try:
+                parsed = date(year, month, day)
+            except ValueError:
+                return None
+            if not year_part and parsed < today:
+                try:
+                    parsed = date(year + 1, month, day)
+                except ValueError:
+                    return None
+            return parsed.isoformat()
+
+        return None
+
+    @staticmethod
+    def _extract_calendar_search_terms(message: str) -> list[str]:
+        text = re.sub(r"[^a-z0-9\s]", " ", message.lower())
+        tokens = [t for t in text.split() if t]
+        stop = {
+            "could", "couldnt", "couldn", "not", "find", "this", "event",
+            "cant", "can", "t", "cannot", "where", "is", "the", "a", "an",
+            "i", "see", "don", "dont", "do", "no", "on", "for", "at", "to",
+            "my", "calendar", "it", "that", "was", "be", "please",
+        }
+        terms: list[str] = []
+        seen: set[str] = set()
+        for tok in tokens:
+            if tok in stop or tok.isdigit() or len(tok) < 3:
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            terms.append(tok)
+        return terms[:4]
 
     @staticmethod
     def _looks_like_deep_request(message: str) -> bool:
@@ -491,6 +580,65 @@ class NestorBrain:
         self._memory.delete_pending_action(user_id)
         return None
 
+    async def _maybe_handle_calendar_troubleshooting(
+        self,
+        user_id: int,
+        user_name: str,
+        message: str,
+    ) -> str | None:
+        if not self._is_calendar_troubleshooting_followup(message):
+            return None
+
+        date_hint = self._resolve_date_hint(message)
+
+        # Prefer direct date listing when a date/day hint is present.
+        if date_hint and "list_calendar_events" in self._tools:
+            listed = await self._tools.execute(
+                "list_calendar_events",
+                {"start_date": date_hint, "end_date": date_hint},
+            )
+            listed_text = str(listed)
+            if listed_text.startswith("Found "):
+                reply = (
+                    "Certainly. I checked the calendar directly. "
+                    f"Here are the entries for {date_hint}:\n\n{listed_text}"
+                )
+            else:
+                reply = (
+                    "I checked the calendar directly and found no events on "
+                    f"{date_hint}. If you wish, I can recreate it now."
+                )
+            self._persist_exchange(user_id, user_name, message, reply)
+            return reply
+
+        if "search_calendar_events" not in self._tools:
+            return None
+
+        search_terms = self._extract_calendar_search_terms(message)
+        if not search_terms:
+            search_terms = ["appointment", "meeting", "event"]
+
+        for query in search_terms:
+            result = await self._tools.execute(
+                "search_calendar_events", {"query": query, "days_ahead": 30}
+            )
+            text = str(result)
+            if text.startswith("Found "):
+                reply = (
+                    "Certainly. I checked the calendar directly. "
+                    "Here is the closest matching result:\n\n"
+                    f"{text}"
+                )
+                self._persist_exchange(user_id, user_name, message, reply)
+                return reply
+
+        reply = (
+            "I checked the calendar directly and do not see a matching event. "
+            "If you wish, I can recreate it now."
+        )
+        self._persist_exchange(user_id, user_name, message, reply)
+        return reply
+
     @staticmethod
     def _assistant_message_from_response(
         response: LLMResponse,
@@ -533,6 +681,12 @@ class NestorBrain:
         )
         if confirmation_reply is not None:
             return confirmation_reply
+
+        calendar_troubleshooting_reply = await self._maybe_handle_calendar_troubleshooting(
+            user_id, user_name, message
+        )
+        if calendar_troubleshooting_reply is not None:
+            return calendar_troubleshooting_reply
 
         llm = self._select_llm(message, context)
         llm.system_prompt = self._inject_datetime(self._system_prompt)
