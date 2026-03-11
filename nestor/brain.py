@@ -807,6 +807,25 @@ class NestorBrain:
             # Execute tools and feed results back.
             tool_results = await self._execute_tool_calls(response.tool_calls)
             executed_tool_names.update(tc.name for tc in response.tool_calls)
+
+            # Hard safety guard: never let calendar creation failures be narrated
+            # as successes by the model.
+            for tc, result in zip(response.tool_calls, tool_results):
+                if tc.name != "create_calendar_event":
+                    continue
+                content = str(result.get("content", ""))
+                if not content.lower().startswith("error creating event"):
+                    continue
+                reply = (
+                    "I could not add that calendar event. "
+                    f"Calendar tool returned: {content}. "
+                    "I did not create anything."
+                )
+                if "invalid_grant" in content.lower() or "expired or revoked" in content.lower():
+                    reply += " Google authorization appears expired; please re-run google_auth_setup.py."
+                self._persist_exchange(user_id, user_name, message, reply)
+                return reply
+
             messages.extend(tool_results)
 
         final_text = response.text if response else None
