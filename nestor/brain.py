@@ -50,6 +50,13 @@ _CALENDAR_TROUBLESHOOT_HINTS = {
     "where is this event",
 }
 
+_RETRY_HINTS = {
+    "try again",
+    "try now",
+    "retry",
+    "again",
+}
+
 _ACTION_INTENT_KEYWORDS = {
     " add ",
     " create ",
@@ -325,7 +332,8 @@ class NestorBrain:
             "could", "couldnt", "couldn", "not", "find", "this", "event",
             "cant", "can", "t", "cannot", "where", "is", "the", "a", "an",
             "i", "see", "don", "dont", "do", "no", "on", "for", "at", "to",
-            "my", "calendar", "it", "that", "was", "be", "please",
+            "my", "calendar", "it", "that", "was", "be", "please", "try", "again",
+            "now", "retry",
         }
         terms: list[str] = []
         seen: set[str] = set()
@@ -337,6 +345,25 @@ class NestorBrain:
             seen.add(tok)
             terms.append(tok)
         return terms[:4]
+
+    def _latest_calendar_create_request_text(self, user_id: int) -> str | None:
+        rows = self._memory.get_recent_messages(user_id, limit=12)
+        for row in reversed(rows):
+            if row.get("role") != "user":
+                continue
+            content = str(row.get("content", ""))
+            if "]:" in content:
+                content = content.split("]:", 1)[1].strip()
+            normalized = re.sub(r"\s+", " ", content.lower()).strip()
+            if not normalized:
+                continue
+            if self._is_calendar_troubleshooting_followup(content):
+                continue
+            if normalized in _RETRY_HINTS:
+                continue
+            if self._looks_like_calendar_create_request(content):
+                return content
+        return None
 
     @staticmethod
     def _looks_like_deep_request(message: str) -> bool:
@@ -586,10 +613,18 @@ class NestorBrain:
         user_name: str,
         message: str,
     ) -> str | None:
-        if not self._is_calendar_troubleshooting_followup(message):
+        normalized = re.sub(r"\s+", " ", message.lower()).strip()
+        is_retry = normalized in _RETRY_HINTS
+        if not self._is_calendar_troubleshooting_followup(message) and not is_retry:
             return None
 
-        date_hint = self._resolve_date_hint(message)
+        search_message = message
+        if is_retry:
+            prior_create_request = self._latest_calendar_create_request_text(user_id)
+            if prior_create_request:
+                search_message = prior_create_request
+
+        date_hint = self._resolve_date_hint(search_message)
 
         # Prefer direct date listing when a date/day hint is present.
         if date_hint and "list_calendar_events" in self._tools:
@@ -614,7 +649,7 @@ class NestorBrain:
         if "search_calendar_events" not in self._tools:
             return None
 
-        search_terms = self._extract_calendar_search_terms(message)
+        search_terms = self._extract_calendar_search_terms(search_message)
         if not search_terms:
             search_terms = ["appointment", "meeting", "event"]
 
