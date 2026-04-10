@@ -63,16 +63,20 @@ class MemoryStore:
     def _create_tables(self) -> None:
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS conversations (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL,
-                role        TEXT    NOT NULL CHECK(role IN ('user', 'assistant', 'tool')),
-                content     TEXT    NOT NULL,
-                tool_name   TEXT,
-                timestamp   DATETIME DEFAULT (datetime('now'))
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id          INTEGER NOT NULL,
+                conversation_key TEXT,
+                role             TEXT    NOT NULL CHECK(role IN ('user', 'assistant', 'tool')),
+                content          TEXT    NOT NULL,
+                tool_name        TEXT,
+                timestamp        DATETIME DEFAULT (datetime('now'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_conversations_user_ts
                 ON conversations(user_id, timestamp DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_conversations_scope_ts
+                ON conversations(conversation_key, timestamp DESC, id DESC);
 
             CREATE TABLE IF NOT EXISTS user_metadata (
                 user_id     INTEGER NOT NULL,
@@ -83,11 +87,15 @@ class MemoryStore:
             );
 
             CREATE TABLE IF NOT EXISTS pending_actions (
-                user_id     INTEGER PRIMARY KEY,
-                token       TEXT    NOT NULL,
-                tool_calls  TEXT    NOT NULL,
-                created_at  DATETIME DEFAULT (datetime('now'))
+                user_id           INTEGER PRIMARY KEY,
+                conversation_key  TEXT,
+                token             TEXT    NOT NULL,
+                tool_calls        TEXT    NOT NULL,
+                created_at        DATETIME DEFAULT (datetime('now'))
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_actions_scope
+                ON pending_actions(conversation_key);
 
             CREATE TABLE IF NOT EXISTS notes (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +105,45 @@ class MemoryStore:
                 updated_at  DATETIME DEFAULT (datetime('now'))
             );
         """)
+        self._migrate_schema()
         self.conn.commit()
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(r["name"]) == column for r in rows)
+
+    def _migrate_schema(self) -> None:
+        """Apply additive schema migrations for conversation scoping."""
+        if not self._column_exists("conversations", "conversation_key"):
+            self.conn.execute(
+                "ALTER TABLE conversations ADD COLUMN conversation_key TEXT"
+            )
+
+        self.conn.execute(
+            "UPDATE conversations "
+            "SET conversation_key = 'legacy:' || CAST(user_id AS TEXT) "
+            "WHERE conversation_key IS NULL OR trim(conversation_key) = ''"
+        )
+
+        if not self._column_exists("pending_actions", "conversation_key"):
+            self.conn.execute(
+                "ALTER TABLE pending_actions ADD COLUMN conversation_key TEXT"
+            )
+
+        self.conn.execute(
+            "UPDATE pending_actions "
+            "SET conversation_key = 'legacy:' || CAST(user_id AS TEXT) "
+            "WHERE conversation_key IS NULL OR trim(conversation_key) = ''"
+        )
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_scope_ts "
+            "ON conversations(conversation_key, timestamp DESC, id DESC)"
+        )
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_actions_scope "
+            "ON pending_actions(conversation_key)"
+        )
 
     # ── Conversation messages ────────────────────────────────────────
 
@@ -107,26 +153,33 @@ class MemoryStore:
         role: str,
         content: str,
         tool_name: str | None = None,
+        conversation_key: str | None = None,
     ) -> None:
         """Persist a single conversation message."""
+        scope = (conversation_key or f"legacy:{user_id}").strip()
         self.conn.execute(
-            "INSERT INTO conversations (user_id, role, content, tool_name) "
-            "VALUES (?, ?, ?, ?)",
-            (user_id, role, content, tool_name),
+            "INSERT INTO conversations "
+            "(user_id, conversation_key, role, content, tool_name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, scope, role, content, tool_name),
         )
         self.conn.commit()
 
     def get_recent_messages(
-        self, user_id: int, limit: int = 50
+        self,
+        user_id: int,
+        limit: int = 50,
+        conversation_key: str | None = None,
     ) -> list[dict]:
-        """Return the most recent messages for a user (oldest-first)."""
+        """Return the most recent messages for a scoped conversation (oldest-first)."""
+        scope = (conversation_key or f"legacy:{user_id}").strip()
         rows = self.conn.execute(
             "SELECT role, content, tool_name, timestamp "
             "FROM conversations "
-            "WHERE user_id = ? "
+            "WHERE conversation_key = ? "
             "ORDER BY timestamp DESC, id DESC "
             "LIMIT ?",
-            (user_id, limit),
+            (scope, limit),
         ).fetchall()
         return [
             {
@@ -172,32 +225,53 @@ class MemoryStore:
     # ── Pending actions (survive restarts) ────────────────────────────
 
     def save_pending_action(
-        self, user_id: int, token: str, tool_calls_json: str
+        self,
+        user_id: int,
+        token: str,
+        tool_calls_json: str,
+        conversation_key: str | None = None,
     ) -> None:
         """Store a pending confirmation action."""
+        scope = (conversation_key or f"legacy:{user_id}").strip()
         self.conn.execute(
-            "INSERT OR REPLACE INTO pending_actions (user_id, token, tool_calls, created_at) "
-            "VALUES (?, ?, ?, datetime('now'))",
-            (user_id, token, tool_calls_json),
+            "INSERT OR REPLACE INTO pending_actions "
+            "(user_id, conversation_key, token, tool_calls, created_at) "
+            "VALUES (?, ?, ?, ?, datetime('now'))",
+            (user_id, scope, token, tool_calls_json),
         )
         self.conn.commit()
 
-    def get_pending_action(self, user_id: int) -> dict | None:
-        """Retrieve a pending action for a user (or None)."""
+    def get_pending_action(
+        self,
+        user_id: int,
+        conversation_key: str | None = None,
+    ) -> dict | None:
+        """Retrieve a pending action for a scoped conversation (or None)."""
+        scope = (conversation_key or f"legacy:{user_id}").strip()
         row = self.conn.execute(
-            "SELECT token, tool_calls, created_at FROM pending_actions WHERE user_id = ?",
-            (user_id,),
+            "SELECT token, tool_calls, created_at "
+            "FROM pending_actions WHERE conversation_key = ?",
+            (scope,),
         ).fetchone()
         return (
-            {"token": row["token"], "tool_calls": row["tool_calls"], "created_at": row["created_at"]}
+            {
+                "token": row["token"],
+                "tool_calls": row["tool_calls"],
+                "created_at": row["created_at"],
+            }
             if row
             else None
         )
 
-    def delete_pending_action(self, user_id: int) -> None:
-        """Remove a pending action."""
+    def delete_pending_action(
+        self,
+        user_id: int,
+        conversation_key: str | None = None,
+    ) -> None:
+        """Remove a pending action for a scoped conversation."""
+        scope = (conversation_key or f"legacy:{user_id}").strip()
         self.conn.execute(
-            "DELETE FROM pending_actions WHERE user_id = ?", (user_id,)
+            "DELETE FROM pending_actions WHERE conversation_key = ?", (scope,)
         )
         self.conn.commit()
 
