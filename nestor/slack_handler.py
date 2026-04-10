@@ -172,6 +172,7 @@ def create_slack_socket_runtime(
             f"Slack-{user_id}",
             text,
             context,
+            conversation_key=scope,
         )
 
         if not reply.strip():

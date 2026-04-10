@@ -298,6 +298,7 @@ async def _run() -> None:
                 user_name,
                 text,
                 {"source": "telegram"},
+                conversation_key=f"telegram:{user_id}",
             ),
             today_handler=brain.get_today_summary,
             week_handler=brain.get_week_summary,
