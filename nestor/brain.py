@@ -189,9 +189,14 @@ class NestorBrain:
         user_id: int,
         user_name: str,
         message: str,
+        conversation_key: str,
     ) -> list[dict[str, Any]]:
         """Load history and assemble the full message list."""
-        history_rows = self._memory.get_recent_messages(user_id, limit=30)
+        history_rows = self._memory.get_recent_messages(
+            user_id,
+            limit=30,
+            conversation_key=conversation_key,
+        )
         messages: list[dict[str, Any]] = []
         for row in history_rows:
             messages.append({"role": row["role"], "content": row["content"]})
@@ -346,8 +351,16 @@ class NestorBrain:
             terms.append(tok)
         return terms[:4]
 
-    def _latest_calendar_create_request_text(self, user_id: int) -> str | None:
-        rows = self._memory.get_recent_messages(user_id, limit=12)
+    def _latest_calendar_create_request_text(
+        self,
+        user_id: int,
+        conversation_key: str,
+    ) -> str | None:
+        rows = self._memory.get_recent_messages(
+            user_id,
+            limit=12,
+            conversation_key=conversation_key,
+        )
         for row in reversed(rows):
             if row.get("role") != "user":
                 continue
@@ -518,18 +531,43 @@ class NestorBrain:
         return "\n".join(lines)
 
     def _persist_exchange(
-        self, user_id: int, user_name: str, user_message: str, assistant_message: str
+        self,
+        user_id: int,
+        user_name: str,
+        user_message: str,
+        assistant_message: str,
+        conversation_key: str,
     ) -> None:
-        self._memory.save_message(user_id, "user", f"[{user_name}]: {user_message}")
-        self._memory.save_message(user_id, "assistant", assistant_message)
+        self._memory.save_message(
+            user_id,
+            "user",
+            f"[{user_name}]: {user_message}",
+            conversation_key=conversation_key,
+        )
+        self._memory.save_message(
+            user_id,
+            "assistant",
+            assistant_message,
+            conversation_key=conversation_key,
+        )
 
-    def _get_pending_action(self, user_id: int) -> PendingAction | None:
-        row = self._memory.get_pending_action(user_id)
+    def _get_pending_action(
+        self,
+        user_id: int,
+        conversation_key: str,
+    ) -> PendingAction | None:
+        row = self._memory.get_pending_action(
+            user_id,
+            conversation_key=conversation_key,
+        )
         if not row:
             return None
         created = datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) - created > _CONFIRMATION_TTL:
-            self._memory.delete_pending_action(user_id)
+            self._memory.delete_pending_action(
+                user_id,
+                conversation_key=conversation_key,
+            )
             return None
         tool_calls = [
             ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"])
@@ -551,9 +589,19 @@ class NestorBrain:
             "don't", "dont", "stop", "nevermind", "never mind",
         }
 
-    def _stage_pending_action(self, user_id: int, tool_calls: list[ToolCall]) -> str:
+    def _stage_pending_action(
+        self,
+        user_id: int,
+        conversation_key: str,
+        tool_calls: list[ToolCall],
+    ) -> str:
         tc_json = json.dumps([{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls])
-        self._memory.save_pending_action(user_id, "yes", tc_json)
+        self._memory.save_pending_action(
+            user_id,
+            "yes",
+            tc_json,
+            conversation_key=conversation_key,
+        )
 
         lines = ["Before I proceed, here's what I'm about to do:"]
         for tc in tool_calls:
@@ -584,27 +632,52 @@ class NestorBrain:
         return "\n".join(lines)
 
     async def _maybe_handle_confirmation(
-        self, user_id: int, user_name: str, message: str
+        self,
+        user_id: int,
+        user_name: str,
+        message: str,
+        conversation_key: str,
     ) -> str | None:
-        pending = self._get_pending_action(user_id)
+        pending = self._get_pending_action(user_id, conversation_key)
         if not pending:
             return None
 
         if self._is_yes_message(message):
             tool_results = await self._execute_tool_calls(pending.tool_calls)
-            self._memory.delete_pending_action(user_id)
+            self._memory.delete_pending_action(
+                user_id,
+                conversation_key=conversation_key,
+            )
             reply = self._format_confirmed_results(pending.tool_calls, tool_results)
-            self._persist_exchange(user_id, user_name, message, reply)
+            self._persist_exchange(
+                user_id,
+                user_name,
+                message,
+                reply,
+                conversation_key,
+            )
             return reply
 
         if self._is_no_message(message):
-            self._memory.delete_pending_action(user_id)
+            self._memory.delete_pending_action(
+                user_id,
+                conversation_key=conversation_key,
+            )
             reply = "Very good, Sir. Consider it banished to the void — along with the Captain's last attempt at soufflé."
-            self._persist_exchange(user_id, user_name, message, reply)
+            self._persist_exchange(
+                user_id,
+                user_name,
+                message,
+                reply,
+                conversation_key,
+            )
             return reply
 
         # Not a yes/no — clear pending and process as a new message
-        self._memory.delete_pending_action(user_id)
+        self._memory.delete_pending_action(
+            user_id,
+            conversation_key=conversation_key,
+        )
         return None
 
     async def _maybe_handle_calendar_troubleshooting(
@@ -612,6 +685,7 @@ class NestorBrain:
         user_id: int,
         user_name: str,
         message: str,
+        conversation_key: str,
     ) -> str | None:
         normalized = re.sub(r"\s+", " ", message.lower()).strip()
         is_retry = normalized in _RETRY_HINTS
@@ -620,7 +694,10 @@ class NestorBrain:
 
         search_message = message
         if is_retry:
-            prior_create_request = self._latest_calendar_create_request_text(user_id)
+            prior_create_request = self._latest_calendar_create_request_text(
+                user_id,
+                conversation_key,
+            )
             if prior_create_request:
                 search_message = prior_create_request
 
@@ -643,7 +720,13 @@ class NestorBrain:
                     "I checked the calendar directly and found no events on "
                     f"{date_hint}. If you wish, I can recreate it now."
                 )
-            self._persist_exchange(user_id, user_name, message, reply)
+            self._persist_exchange(
+                user_id,
+                user_name,
+                message,
+                reply,
+                conversation_key,
+            )
             return reply
 
         if "search_calendar_events" not in self._tools:
@@ -664,14 +747,26 @@ class NestorBrain:
                     "Here is the closest matching result:\n\n"
                     f"{text}"
                 )
-                self._persist_exchange(user_id, user_name, message, reply)
+                self._persist_exchange(
+                    user_id,
+                    user_name,
+                    message,
+                    reply,
+                    conversation_key,
+                )
                 return reply
 
         reply = (
             "I checked the calendar directly and do not see a matching event. "
             "If you wish, I can recreate it now."
         )
-        self._persist_exchange(user_id, user_name, message, reply)
+        self._persist_exchange(
+            user_id,
+            user_name,
+            message,
+            reply,
+            conversation_key,
+        )
         return reply
 
     @staticmethod
@@ -706,19 +801,28 @@ class NestorBrain:
         user_name: str,
         message: str,
         context: dict[str, str] | None = None,
+        conversation_key: str | None = None,
     ) -> str:
         """Process a user message through the full agentic loop.
 
         Returns the final text response from the LLM.
         """
+        scoped_key = (conversation_key or f"legacy:{user_id}").strip()
+
         confirmation_reply = await self._maybe_handle_confirmation(
-            user_id, user_name, message
+            user_id,
+            user_name,
+            message,
+            scoped_key,
         )
         if confirmation_reply is not None:
             return confirmation_reply
 
         calendar_troubleshooting_reply = await self._maybe_handle_calendar_troubleshooting(
-            user_id, user_name, message
+            user_id,
+            user_name,
+            message,
+            scoped_key,
         )
         if calendar_troubleshooting_reply is not None:
             return calendar_troubleshooting_reply
@@ -732,7 +836,12 @@ class NestorBrain:
             (context or {}).get("channel_id", ""),
         )
 
-        messages = self._build_messages(user_id, user_name, message)
+        messages = self._build_messages(
+            user_id,
+            user_name,
+            message,
+            scoped_key,
+        )
         tool_defs = self._tools.get_all_schemas()
         action_request = self._looks_like_action_request(message)
         calendar_action_request = self._looks_like_calendar_create_request(message)
@@ -835,8 +944,18 @@ class NestorBrain:
             needs_confirm = [tc for tc in response.tool_calls if tc.name in _CONFIRM_TOOLS]
             if needs_confirm:
                 # Stage all tool calls (confirmed ones gate the batch)
-                final_text = self._stage_pending_action(user_id, response.tool_calls)
-                self._persist_exchange(user_id, user_name, message, final_text)
+                final_text = self._stage_pending_action(
+                    user_id,
+                    scoped_key,
+                    response.tool_calls,
+                )
+                self._persist_exchange(
+                    user_id,
+                    user_name,
+                    message,
+                    final_text,
+                    scoped_key,
+                )
                 return final_text
 
             # Execute tools and feed results back.
@@ -858,7 +977,13 @@ class NestorBrain:
                 )
                 if "invalid_grant" in content.lower() or "expired or revoked" in content.lower():
                     reply += " Google authorization appears expired; please re-run google_auth_setup.py."
-                self._persist_exchange(user_id, user_name, message, reply)
+                self._persist_exchange(
+                    user_id,
+                    user_name,
+                    message,
+                    reply,
+                    scoped_key,
+                )
                 return reply
 
             messages.extend(tool_results)
@@ -878,7 +1003,13 @@ class NestorBrain:
                 "trouble you to rephrase the request?"
             )
 
-        self._persist_exchange(user_id, user_name, message, final_text)
+        self._persist_exchange(
+            user_id,
+            user_name,
+            message,
+            final_text,
+            scoped_key,
+        )
 
         return final_text
 
@@ -889,7 +1020,13 @@ class NestorBrain:
             "of the day's schedule.  If there is nothing scheduled, "
             "let me know."
         )
-        return await self.handle_message(user_id, "User", prompt)
+        return await self.handle_message(
+            user_id,
+            "User",
+            prompt,
+            context={"source": "telegram", "channel_id": ""},
+            conversation_key=f"telegram:{user_id}",
+        )
 
     async def get_week_summary(self, user_id: int) -> str:
         """Ask the LLM to summarise the coming week for *user_id*."""
@@ -898,4 +1035,10 @@ class NestorBrain:
             "me a concise overview of the week ahead.  Highlight anything "
             "that needs preparation."
         )
-        return await self.handle_message(user_id, "User", prompt)
+        return await self.handle_message(
+            user_id,
+            "User",
+            prompt,
+            context={"source": "telegram", "channel_id": ""},
+            conversation_key=f"telegram:{user_id}",
+        )
