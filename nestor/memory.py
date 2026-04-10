@@ -75,8 +75,6 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_conversations_user_ts
                 ON conversations(user_id, timestamp DESC);
 
-            CREATE INDEX IF NOT EXISTS idx_conversations_scope_ts
-                ON conversations(conversation_key, timestamp DESC, id DESC);
 
             CREATE TABLE IF NOT EXISTS user_metadata (
                 user_id     INTEGER NOT NULL,
@@ -93,9 +91,6 @@ class MemoryStore:
                 tool_calls        TEXT    NOT NULL,
                 created_at        DATETIME DEFAULT (datetime('now'))
             );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_actions_scope
-                ON pending_actions(conversation_key);
 
             CREATE TABLE IF NOT EXISTS notes (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
