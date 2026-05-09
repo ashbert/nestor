@@ -70,6 +70,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._schemas_cache: list[dict[str, Any]] | None = None
 
     # Mutation --------------------------------------------------------------------
 
@@ -80,6 +81,7 @@ class ToolRegistry:
                 f"A tool named {tool.name!r} is already registered."
             )
         self._tools[tool.name] = tool
+        self._schemas_cache = None
         logger.debug("Registered tool %r", tool.name)
 
     # Lookup ----------------------------------------------------------------------
@@ -96,7 +98,9 @@ class ToolRegistry:
 
     def get_all_schemas(self) -> list[dict[str, Any]]:
         """Return JSON-serialisable schemas for every registered tool."""
-        return [tool.schema() for tool in self._tools.values()]
+        if self._schemas_cache is None:
+            self._schemas_cache = [tool.schema() for tool in self._tools.values()]
+        return self._schemas_cache
 
     # Execution -------------------------------------------------------------------
 
