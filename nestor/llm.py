@@ -90,6 +90,11 @@ _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # seconds
 
 
+def _is_retryable_status(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
 async def _retry(coro_factory, *, retries: int = _MAX_RETRIES):
     """Call *coro_factory()* up to *retries* times with exponential backoff.
 
@@ -106,6 +111,8 @@ async def _retry(coro_factory, *, retries: int = _MAX_RETRIES):
             anthropic.APIStatusError,
             openai.APIStatusError,
         ) as exc:
+            if not _is_retryable_status(exc):
+                raise
             last_exc = exc
             if attempt == retries:
                 break
@@ -140,8 +147,23 @@ class AnthropicProvider(LLMProvider):
         self._model = model
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
+        self._cached_tools_key: tuple[str, ...] | None = None
+        self._cached_tools_payload: list[dict[str, Any]] | None = None
 
     # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _tools_key(tools: list[dict[str, Any]]) -> tuple[str, ...]:
+        names: list[str] = []
+        for tool in tools:
+            if "name" in tool:
+                names.append(str(tool.get("name", "")))
+            elif "function" in tool:
+                func = tool.get("function") or {}
+                names.append(str(func.get("name", "")))
+            else:
+                names.append("")
+        return tuple(names)
 
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -168,6 +190,15 @@ class AnthropicProvider(LLMProvider):
             else:
                 converted.append(tool)
         return converted
+
+    def _prepare_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        key = self._tools_key(tools)
+        if self._cached_tools_key == key and self._cached_tools_payload is not None:
+            return self._cached_tools_payload
+        payload = self._convert_tools(tools)
+        self._cached_tools_key = key
+        self._cached_tools_payload = payload
+        return payload
 
     @staticmethod
     def _parse_response(response: anthropic.types.Message) -> LLMResponse:
@@ -207,7 +238,7 @@ class AnthropicProvider(LLMProvider):
         if self._system_prompt:
             kwargs["system"] = self._system_prompt
         if tools:
-            kwargs["tools"] = self._convert_tools(tools)
+            kwargs["tools"] = self._prepare_tools(tools)
             if force_tool_use:
                 kwargs["tool_choice"] = {"type": "any"}
 
@@ -234,8 +265,23 @@ class OpenAIProvider(LLMProvider):
         self._model = model
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
+        self._cached_tools_key: tuple[str, ...] | None = None
+        self._cached_tools_payload: list[dict[str, Any]] | None = None
 
     # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _tools_key(tools: list[dict[str, Any]]) -> tuple[str, ...]:
+        names: list[str] = []
+        for tool in tools:
+            if "name" in tool:
+                names.append(str(tool.get("name", "")))
+            elif "function" in tool:
+                func = tool.get("function") or {}
+                names.append(str(func.get("name", "")))
+            else:
+                names.append("")
+        return tuple(names)
 
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -260,6 +306,15 @@ class OpenAIProvider(LLMProvider):
                     }
                 )
         return converted
+
+    def _prepare_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        key = self._tools_key(tools)
+        if self._cached_tools_key == key and self._cached_tools_payload is not None:
+            return self._cached_tools_payload
+        payload = self._convert_tools(tools)
+        self._cached_tools_key = key
+        self._cached_tools_payload = payload
+        return payload
 
     def _build_messages(
         self, messages: list[dict[str, Any]]
@@ -314,7 +369,7 @@ class OpenAIProvider(LLMProvider):
             "messages": full_messages,
         }
         if tools:
-            kwargs["tools"] = self._convert_tools(tools)
+            kwargs["tools"] = self._prepare_tools(tools)
             if force_tool_use:
                 kwargs["tool_choice"] = "required"
 
